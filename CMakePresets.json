@@ -1,0 +1,86 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "linux-gcc",
+      "inherits": "base",
+      "displayName": "Linux, g++, Panda3D compiled from source",
+      "binaryDir": "${sourceDir}/build/linux",
+      "cacheVariables": { "CMAKE_C_COMPILER": "gcc", "CMAKE_CXX_COMPILER": "g++" },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
+    },
+    {
+      "name": "linux-gles",
+      "inherits": "linux-gcc",
+      "displayName": "Linux, g++, OpenGL ES through EGL (the Android renderer, to try it on a PC)",
+      "binaryDir": "${sourceDir}/build/linux-gles",
+      "cacheVariables": { "ARENA_GLES": "ON" }
+    },
+    {
+      "name": "linux-gcc-sdk",
+      "inherits": "linux-gcc",
+      "displayName": "Linux, g++, installed Panda3D SDK (shadows with the Cg shader generator)",
+      "binaryDir": "${sourceDir}/build/linux-sdk",
+      "cacheVariables": { "ARENA_PANDA3D_FROM_SOURCE": "OFF" }
+    },
+    {
+      "name": "windows-mingw",
+      "inherits": "base",
+      "displayName": "Windows, MinGW-w64 g++ (g++, cmake and ninja on the PATH)",
+      "binaryDir": "${sourceDir}/build/mingw",
+      "cacheVariables": { "CMAKE_C_COMPILER": "gcc", "CMAKE_CXX_COMPILER": "g++" },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+    },
+    {
+      "name": "android-arm64",
+      "inherits": "base",
+      "displayName": "Android phones (arm64-v8a), the NDK's clang; makes bin/PandaArena.apk",
+      "binaryDir": "${sourceDir}/build/android-arm64",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/android.cmake",
+      "warnings": { "deprecated": false },
+      "cacheVariables": {
+        "ANDROID_ABI": "arm64-v8a",
+        "ANDROID_PLATFORM": "android-24",
+        "ANDROID_STL": "c++_static"
+      }
+    },
+    {
+      "name": "android-x86_64",
+      "inherits": "android-arm64",
+      "displayName": "Android emulator and Chromebooks (x86_64)",
+      "binaryDir": "${sourceDir}/build/android-x86_64",
+      "cacheVariables": { "ANDROID_ABI": "x86_64" }
+    },
+    {
+      "name": "windows-mingw-cross",
+      "inherits": "base",
+      "displayName": "Windows .exe cross-compiled on Linux with MinGW-w64 g++",
+      "binaryDir": "${sourceDir}/build/mingw-cross",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/mingw-w64-x86_64.cmake",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "linux-gcc", "configurePreset": "linux-gcc" },
+    { "name": "linux-gcc-sdk", "configurePreset": "linux-gcc-sdk" },
+    { "name": "linux-gles", "configurePreset": "linux-gles" },
+    { "name": "windows-mingw", "configurePreset": "windows-mingw" },
+    { "name": "windows-mingw-cross", "configurePreset": "windows-mingw-cross" },
+    { "name": "android-arm64", "configurePreset": "android-arm64" },
+    { "name": "android-x86_64", "configurePreset": "android-x86_64" }
+  ],
+  "testPresets": [
+    { "name": "linux-gcc", "configurePreset": "linux-gcc", "output": { "outputOnFailure": true } },
+    { "name": "linux-gcc-sdk", "configurePreset": "linux-gcc-sdk", "output": { "outputOnFailure": true } },
+    { "name": "windows-mingw", "configurePreset": "windows-mingw", "output": { "outputOnFailure": true } },
+    { "name": "windows-mingw-cross", "configurePreset": "windows-mingw-cross",
+      "output": { "outputOnFailure": true } }
+  ]
+}

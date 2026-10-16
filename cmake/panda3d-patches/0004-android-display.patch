@@ -1,0 +1,72 @@
+diff --git a/panda/src/androiddisplay/androidGraphicsWindow.cxx b/panda/src/androiddisplay/androidGraphicsWindow.cxx
+--- a/panda/src/androiddisplay/androidGraphicsWindow.cxx
++++ b/panda/src/androiddisplay/androidGraphicsWindow.cxx
+@@ -184,10 +184,12 @@
+   int events;
+   struct android_poll_source* source;
+ 
+-  // Loop until all events are read.
+-  while ((looper_id = ALooper_pollAll(0, nullptr, &events, (void**)&source)) >= 0) {
++  // Loop until all events are read.  (Newer NDKs no longer offer
++  // ALooper_pollAll; ALooper_pollOnce also returns after running callbacks.)
++  while ((looper_id = ALooper_pollOnce(0, nullptr, &events, (void**)&source)) >= 0 ||
++         looper_id == ALOOPER_POLL_CALLBACK) {
+     // Process this event.
+-    if (source != nullptr) {
++    if (looper_id >= 0 && source != nullptr) {
+       source->process(_app, source);
+     }
+   }
+@@ -429,7 +431,17 @@
+       system_changed_properties(properties);
+       break;
+     case APP_CMD_TERM_WINDOW:
+-      destroy_surface();
++      // The app goes to the background.  Only the surface goes with the
++      // window: the context, and everything uploaded to it, is kept for when
++      // the window comes back (APP_CMD_INIT_WINDOW makes a new surface).
++      if (_egl_surface != EGL_NO_SURFACE) {
++        eglMakeCurrent(_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++        if (!eglDestroySurface(_egl_display, _egl_surface)) {
++          androiddisplay_cat.error() << "Failed to destroy surface: "
++            << get_egl_error_string(eglGetError()) << "\n";
++        }
++        _egl_surface = EGL_NO_SURFACE;
++      }
+       properties.set_minimized(true);
+       system_changed_properties(properties);
+       break;
+diff --git a/panda/src/androiddisplay/androidGraphicsStateGuardian.cxx b/panda/src/androiddisplay/androidGraphicsStateGuardian.cxx
+--- a/panda/src/androiddisplay/androidGraphicsStateGuardian.cxx
++++ b/panda/src/androiddisplay/androidGraphicsStateGuardian.cxx
+@@ -225,8 +225,15 @@
+   }
+ 
+ #ifdef OPENGLES_2
+-  EGLint context_attribs[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
++  // OpenGL ES 3 where the driver has it (GLSL ES 3.00 shaders, depth
++  // textures), otherwise 2.
++  EGLint context_attribs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
+   _context = eglCreateContext(_egl_display, _fbconfig, _share_context, context_attribs);
++  if (_context == EGL_NO_CONTEXT) {
++    eglGetError();
++    context_attribs[1] = 2;
++    _context = eglCreateContext(_egl_display, _fbconfig, _share_context, context_attribs);
++  }
+ #else
+   _context = eglCreateContext(_egl_display, _fbconfig, _share_context, nullptr);
+ #endif
+diff --git a/dtool/src/prc/notify.cxx b/dtool/src/prc/notify.cxx
+--- a/dtool/src/prc/notify.cxx
++++ b/dtool/src/prc/notify.cxx
+@@ -344,7 +344,9 @@
+   }
+ 
+ #ifdef ANDROID
+-  __android_log_assert("assert", "Panda3D", "Assertion failed: %s", message.c_str());
++  // Log it like everywhere else (__android_log_assert would also abort the
++  // app, which assert-abort decides below).
++  __android_log_print(ANDROID_LOG_ERROR, "Panda3D", "Assertion failed: %s", message.c_str());
+ #endif
+   nout << "Assertion failed: " << message << "\n";
+ 

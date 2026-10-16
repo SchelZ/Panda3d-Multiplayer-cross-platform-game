@@ -1,0 +1,75 @@
+// Distributed classes of Panda Arena.
+//
+// Every participant (ServerRepository, AI repository, C++ client and Python
+// bots) loads direct.dc first and this file second. Class/field numbers and
+// the DC hash depend on that order and on the exact content, and the server
+// refuses clients whose hash differs, so never edit one copy only.
+//
+// Who may send what (enforced by the server, see server/arena/policy.py):
+//   * a player may update its own DistributedArenaPlayer (movement + dash),
+//   * a player may send the p2p fields of AI-owned objects (requests),
+//   * everything else is sent by the AI repository only.
+
+keyword broadcast;
+keyword ram;
+keyword p2p;
+
+from arena.DistributedArenaPlayer/AI import DistributedArenaPlayer/AI
+from arena.DistributedArenaGame/AI import DistributedArenaGame/AI
+
+struct ArenaPillar {
+  int16 / 10 x;
+  int16 / 10 y;
+  uint16 / 100 radius;
+};
+
+struct ArenaOrb {
+  uint16 orbId;
+  int16 / 10 x;
+  int16 / 10 y;
+  uint8(0-1) kind;              // 0 = normal, 1 = gold
+};
+
+struct ArenaScore {
+  uint8 slot;                   // the player's slot (see below)
+  uint16 score;
+};
+
+// One per connected player, created by the player's client in the arena zone.
+// Movement and dashes are not fields: they travel as compact binary messages
+// (CLIENT_MOVE / SERVER_MOVES in server/arena/protocol.py). The server gives
+// every player a one-byte slot, and every field below names players by slot.
+dclass DistributedArenaPlayer : DistributedObject {
+  setName(string(1-16) name) required broadcast ram;
+  setColorIndex(uint8(0-11) index) required broadcast ram;
+};
+
+// One per server, created by the AI in the arena zone. Owns the game state.
+dclass DistributedArenaGame : DistributedObject {
+  // Tuning, decided by the server so clients and server always agree.
+  setRules(uint16 / 100 maxSpeed, uint16 / 100 accel, uint16 / 100 dashSpeed,
+           uint16 / 1000 dashTime, uint16 / 100 dashCooldown,
+           uint16 / 100 playerRadius, uint16 / 100 orbRadius) required broadcast ram;
+  setArena(uint16 / 10 radius, ArenaPillar pillars[]) required broadcast ram;
+  // state: 0 = playing, 1 = intermission. endTime: 32-bit network time.
+  setRound(uint8(0-1) state, uint16 roundNumber, int32 endTime) required broadcast ram;
+  setOrbs(ArenaOrb orbs[]) required broadcast ram;
+  setScores(ArenaScore scores[]) required broadcast ram;
+
+  // Events, AI -> everybody in the zone.
+  orbSpawned(ArenaOrb orb) broadcast;
+  orbCollected(uint16 orbId, uint8 slot, uint16 score) broadcast;
+  playerHit(uint8 attacker, uint8 victim, uint16 attackerScore, uint16 victimScore) broadcast;
+  chatMessage(uint8 slot, string(1-120) text) broadcast;
+  // Game messages as codes (protocol.py NOTICE_*); clients write the text.
+  notice(uint8 kind, uint8 slot, uint16 value) broadcast;
+
+  // Requests, client -> AI (p2p = delivered to the owner of the object only).
+  requestChat(string(1-120) text) p2p;
+  ping(uint16 context) p2p;
+
+  // Replies, AI -> one client (sent as targeted updates).
+  pong(uint16 context);
+  knockback(int8 / 4 vx, int8 / 4 vy);
+  correctPosition(int16 / 100 x, int16 / 100 y);
+};

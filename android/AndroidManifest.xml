@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Panda Arena for Android: no Java code of its own. Android's NativeActivity
+     loads libarena.so (the whole game, Panda3D included) and runs it; see
+     client/src/app/AndroidMain.cpp. tools/make_apk.py fills in the versions
+     and the SDK levels. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+          package="org.pandaarena.game">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- OpenGL ES 3: the shaders are GLSL ES 3.00 (ES 2 phones still run, unlit). -->
+    <uses-feature android:glEsVersion="0x00030000" android:required="true" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+
+    <application android:label="Panda Arena"
+                 android:icon="@mipmap/ic_launcher"
+                 android:hasCode="false"
+                 android:allowBackup="false"
+                 android:extractNativeLibs="true"
+                 android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+        <activity android:name="android.app.NativeActivity"
+                  android:label="Panda Arena"
+                  android:exported="true"
+                  android:launchMode="singleTask"
+                  android:screenOrientation="sensorLandscape"
+                  android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode">
+            <meta-data android:name="android.app.lib_name" android:value="arena" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

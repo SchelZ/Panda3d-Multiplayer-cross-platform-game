@@ -1,0 +1,36 @@
+diff --git a/panda/src/glstuff/glGraphicsStateGuardian_src.cxx b/panda/src/glstuff/glGraphicsStateGuardian_src.cxx
+--- a/panda/src/glstuff/glGraphicsStateGuardian_src.cxx
++++ b/panda/src/glstuff/glGraphicsStateGuardian_src.cxx
+@@ -13729,6 +13729,7 @@
+     // not have gotten here at all.
+     nassertr(!gtc->_immutable, false);
+ 
++    bool leave_uninitialized = false;
+     if (num_ram_mipmap_levels == 0) {
+       if (GLCAT.is_debug()) {
+         GLCAT.debug()
+@@ -13742,6 +13743,15 @@
+         component_type = GL_UNSIGNED_INT_24_8_EXT;
+ #endif
+       }
++#ifdef OPENGLES
++      // OpenGL ES has no unsigned byte depth textures, which is how shadow
++      // maps are set up: allocate unsigned int depth instead, for the shadow
++      // pass to fill (the clear colour image would be a byte per texel).
++      if (external_format == GL_DEPTH_COMPONENT && component_type == GL_UNSIGNED_BYTE) {
++        component_type = GL_UNSIGNED_INT;
++        leave_uninitialized = true;
++      }
++#endif
+     }
+ 
+     for (int n = mipmap_bias; n < num_levels; ++n) {
+@@ -13763,7 +13773,7 @@
+             break;
+           }
+ 
+-          if (tex->has_clear_color()) {
++          if (tex->has_clear_color() && !leave_uninitialized) {
+             // Ask the Texture class to create the mipmap level in RAM. It'll
+             // fill it in with the correct clear color, which we can then
+             // upload.

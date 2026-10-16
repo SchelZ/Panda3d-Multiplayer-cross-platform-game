@@ -1,0 +1,41 @@
+MinGW-w64 14 (e.g. WinLibs GCC 16) declares XINPUT_CAPABILITIES_EX in
+xinput.h, with other member names than Panda3D's own undocumented layout.
+Panda's struct gets a private name on MinGW (xInputDevice.h), lifted only
+around the one #include <xinput.h>. Applies on top of 0001.
+
+diff --git a/panda/src/device/xInputDevice.h b/panda/src/device/xInputDevice.h
+--- a/panda/src/device/xInputDevice.h
++++ b/panda/src/device/xInputDevice.h
+@@ -23,6 +23,12 @@
+ 
+ class InputDeviceManager;
+ 
++#ifdef __MINGW32__
++// MinGW-w64 14's xinput.h declares XINPUT_CAPABILITIES_EX with other member
++// names than Panda's own layout, which therefore gets a name of its own.
++#define _XINPUT_CAPABILITIES_EX _PANDA_XINPUT_CAPABILITIES_EX
++#define XINPUT_CAPABILITIES_EX PANDA_XINPUT_CAPABILITIES_EX
++#endif
+ typedef struct _XINPUT_CAPABILITIES_EX XINPUT_CAPABILITIES_EX;
+ typedef struct _XINPUT_STATE XINPUT_STATE;
+ 
+diff --git a/panda/src/device/xInputDevice.cxx b/panda/src/device/xInputDevice.cxx
+--- a/panda/src/device/xInputDevice.cxx
++++ b/panda/src/device/xInputDevice.cxx
+@@ -19,7 +19,16 @@
+ #include "inputDeviceManager.h"
+ #include "string_utils.h"
+ 
++#ifdef __MINGW32__
++// xinput.h's own XINPUT_CAPABILITIES_EX keeps its name (see xInputDevice.h).
++#undef _XINPUT_CAPABILITIES_EX
++#undef XINPUT_CAPABILITIES_EX
+ #include <xinput.h>
++#define _XINPUT_CAPABILITIES_EX _PANDA_XINPUT_CAPABILITIES_EX
++#define XINPUT_CAPABILITIES_EX PANDA_XINPUT_CAPABILITIES_EX
++#else
++#include <xinput.h>
++#endif
+ #include <cfgmgr32.h>
+ 
+ #ifndef XUSER_MAX_COUNT

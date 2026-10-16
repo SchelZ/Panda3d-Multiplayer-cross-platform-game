@@ -1,0 +1,100 @@
+diff --git a/dtool/src/prc/configPageManager.cxx b/dtool/src/prc/configPageManager.cxx
+index b26eb17..737d250 100644
+--- a/dtool/src/prc/configPageManager.cxx
++++ b/dtool/src/prc/configPageManager.cxx
+@@ -38,7 +38,7 @@
+ #include <algorithm>
+ #include <ctype.h>
+ 
+-#ifndef _MSC_VER
++#ifndef _WIN32
+ #include <dlfcn.h>
+ #endif
+ 
+@@ -120,7 +120,7 @@ reload_implicit_pages() {
+     const char *main_dir;
+     const char *log_filename;
+   };
+-#ifdef _MSC_VER
++#ifdef _WIN32
+   const BlobInfo *blobinfo = (const BlobInfo *)GetProcAddress(GetModuleHandle(NULL), "blobinfo");
+ #elif defined(RTLD_MAIN_ONLY)
+   const BlobInfo *blobinfo = (const BlobInfo *)dlsym(RTLD_MAIN_ONLY, "blobinfo");
+@@ -130,7 +130,7 @@ reload_implicit_pages() {
+   const BlobInfo *blobinfo = (const BlobInfo *)dlsym(dlopen(NULL, RTLD_NOW), "blobinfo");
+ #endif
+   if (blobinfo == nullptr) {
+-#ifndef _MSC_VER
++#ifndef _WIN32
+     // Clear the error flag.
+     dlerror();
+ #endif
+diff --git a/panda/src/device/xInputDevice.cxx b/panda/src/device/xInputDevice.cxx
+index e59a937..cbf4890 100644
+--- a/panda/src/device/xInputDevice.cxx
++++ b/panda/src/device/xInputDevice.cxx
+@@ -68,10 +68,12 @@
+ #define BATTERY_LEVEL_FULL 0x03
+ #endif
+ 
++#ifndef __MINGW32__
+ typedef struct _XINPUT_BATTERY_INFORMATION {
+   BYTE BatteryType;
+   BYTE BatteryLevel;
+ } XINPUT_BATTERY_INFORMATION;
++#endif
+ 
+ // Undocumented, I figured out how this looks by trial and error.
+ typedef struct _XINPUT_BUSINFO {
+diff --git a/panda/src/downloader/httpDate.cxx b/panda/src/downloader/httpDate.cxx
+index e17c6c0..82c145e 100644
+--- a/panda/src/downloader/httpDate.cxx
++++ b/panda/src/downloader/httpDate.cxx
+@@ -226,6 +226,9 @@ HTTPDate(const string &format) {
+     time_t now = time(nullptr);
+     struct tm *tp = localtime(&now);
+     _time -= tp->tm_gmtoff;
++#elif defined(__MINGW32__) && !defined(_UCRT)
++    // msvcrt.dll has no _get_timezone; mktime() already ran _tzset().
++    _time -= _timezone;
+ #elif defined(_WIN32)
+     long int timezone;
+     _get_timezone(&timezone);
+diff --git a/panda/src/nativenet/socket_address.cxx b/panda/src/nativenet/socket_address.cxx
+index 3b8c19d..08b9017 100644
+--- a/panda/src/nativenet/socket_address.cxx
++++ b/panda/src/nativenet/socket_address.cxx
+@@ -14,6 +14,10 @@
+ #include "socket_address.h"
+ #include "config_downloader.h"
+ 
++#ifndef AI_ADDRCONFIG
++#define AI_ADDRCONFIG 0x0400
++#endif
++
+ /**
+  * This function will take a port and string-based TCP address and initialize
+  * the address with this information.  Returns true on success; on failure, it
+diff --git a/panda/src/windisplay/winGraphicsWindow.cxx b/panda/src/windisplay/winGraphicsWindow.cxx
+index c7f8afd..7f168b0 100644
+--- a/panda/src/windisplay/winGraphicsWindow.cxx
++++ b/panda/src/windisplay/winGraphicsWindow.cxx
+@@ -25,6 +25,9 @@
+ 
+ #include <tchar.h>
+ 
++using std::endl;
++using std::wstring;
++
+ #ifndef WM_DPICHANGED
+ #define WM_DPICHANGED 0x02E0
+ #endif
+@@ -41,8 +44,6 @@
+ // Not used on Windows XP, but we still need to define it.
+ #define TOUCH_COORD_TO_PIXEL(l) ((l) / 100)
+ 
+-using std::endl;
+-using std::wstring;
+ 
+ DECLARE_HANDLE(HTOUCHINPUT);
+ #endif
