@@ -1,9 +1,14 @@
 # Toolchain of the android-* presets: finds the Android NDK and uses its own
 # toolchain file. Looks at ANDROID_NDK_HOME, ANDROID_NDK_ROOT and ANDROID_NDK,
 # then for the newest NDK in <SDK>/ndk/ (the SDK from ANDROID_HOME or
-# ANDROID_SDK_ROOT, or Android Studio's default folder).
+# ANDROID_SDK_ROOT, or Android Studio's default folder). The build folder
+# remembers it (ARENA_ANDROID_NDK), so a later build that re-runs CMake finds
+# it again without those variables (a new console).
 
 set(_arena_ndk "")
+if(ARENA_ANDROID_NDK AND EXISTS "${ARENA_ANDROID_NDK}/build/cmake/android.toolchain.cmake")
+    set(_arena_ndk "${ARENA_ANDROID_NDK}")
+endif()
 foreach(_var ANDROID_NDK_HOME ANDROID_NDK_ROOT ANDROID_NDK)
     if(NOT _arena_ndk AND DEFINED ENV{${_var}})
         file(TO_CMAKE_PATH "$ENV{${_var}}" _dir)
@@ -56,4 +61,6 @@ if(NOT _arena_ndk)
         "build/cmake/android.toolchain.cmake).")
 endif()
 
+set(ARENA_ANDROID_NDK "${_arena_ndk}" CACHE PATH "The Android NDK this build folder uses")
+set(ENV{ANDROID_NDK_HOME} "${_arena_ndk}")  # for CMake's test projects (try_compile)
 include("${_arena_ndk}/build/cmake/android.toolchain.cmake")

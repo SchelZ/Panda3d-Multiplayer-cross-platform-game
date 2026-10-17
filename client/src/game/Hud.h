@@ -38,10 +38,7 @@ public:
     Hud &operator=(const Hud &) = delete;
 
     void setAspect(float aspect);  // window width / height
-    void setUiScale(float scale);  // 1 = desktop; larger on phones
-    // Touch screens: other hints, no keyboard help, chat higher up (the
-    // stick is bottom left), no dash bar (the dash button shows it).
-    void setTouchMode(bool touch);
+    void setUiScale(float scale);  // 1 = desktop; larger on phones (laid out for touch there)
     void setVisible(bool visible);
     void reset();  // forget the last game: scores, chat, messages
     void update(const HudState &state, double now);
@@ -72,7 +69,6 @@ private:
     NodePath aspect2d_, root_;
     float aspect_ = 16.0f / 9.0f;
     float scale_ = 1.0f;
-    bool touch_ = false;
 
     PT(TextNode) status_, stats_, round_, center_, announce_, chat_, help_, hint_;
     NodePath statusNp_, statsNp_, roundNp_, centerNp_, announceNp_, chatNp_, helpNp_, hintNp_;

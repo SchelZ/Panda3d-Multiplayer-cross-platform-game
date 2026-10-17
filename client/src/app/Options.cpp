@@ -41,9 +41,6 @@ const char *Options::usage() {
            "  --no-vsync\n"
            "  --low                fixed-function lighting, no shadows, no MSAA\n"
            "  --zoom F             initial camera distance, 0.55 (close) to 1.6 (far)\n"
-           "  --touch              phone controls: connect screen (unless --host), on-screen\n"
-           "                       stick and dash button; the mouse is the finger\n"
-           "  --ui-scale F         size of the 2D interface, 0.8-2 (default 1)\n"
            "\n"
            "automation:\n"
            "  --headless           no window (bots, tests, load generation)\n"
@@ -79,7 +76,6 @@ bool Options::parse(int argc, char **argv, std::string &error, bool &showHelp) {
             const char *v = value("an address");
             if (!v) return false;
             host = v;
-            hostGiven = true;
         } else if (arg == "--port") {
             const char *v = value("a port");
             if (!v || !parseNumber(v, 1, 65535, num)) {
@@ -131,15 +127,6 @@ bool Options::parse(int argc, char **argv, std::string &error, bool &showHelp) {
                 return false;
             }
             zoom = z;
-        } else if (arg == "--touch") {
-            touch = true;
-        } else if (arg == "--ui-scale") {
-            const char *v = value("a number");
-            if (!v || !parseNumber(v, 0.8, 2.0, num)) {
-                if (error.empty()) error = "ui scale must be 0.8-2";
-                return false;
-            }
-            uiScale = static_cast<float>(num);
         } else if (arg == "--low") {
             lowQuality = true;
             shadows = false;

@@ -45,12 +45,13 @@ the client against the same host.
 | F1 / F3 / F11 | help / network statistics / fullscreen |
 | Esc | quit |
 
-On a touch screen (Android, or `--touch` on a PC with the mouse as the finger): the stick
-sits in the bottom-left corner and stays there; put your thumb on it and push the knob
-(direction only: you always run at full speed, like with the keys). The DASH button in
-the bottom-right corner dashes when the button itself is touched, and shows the cooldown.
-Two fingers elsewhere on the right half pinch to zoom; tapping the status line shows
-network statistics; Back returns to the server list.
+On Android: the stick sits in the bottom-left corner and stays there; put your thumb on
+it and push the knob (direction only: you always run at full speed, like with the keys).
+The DASH button in the bottom-right corner dashes when the button itself is touched, and
+shows the cooldown. Two fingers elsewhere on the right half pinch to zoom; tapping the
+status line shows network statistics. Back opens the menu (the connect screen) over the
+game, which goes on behind it, still connected: Back or RESUME returns to it, and only
+joining another server leaves it. Back on the menu without a game closes the app.
 
 ---
 
@@ -141,24 +142,44 @@ What is different on a phone:
 
 * **Renderer:** Panda3D's OpenGL ES renderer (`gles2gsg`) in its Android window
   (`androiddisplay`). makepanda only builds that window for OpenGL ES 1, so
-  `cmake/Panda3DFromSource.cmake` builds it for ES 2/3 itself. Patches 0003 and 0004
+  `cmake/Panda3DFromSource.cmake` builds it for ES 2/3 itself. Patches 0003 to 0005
   (`cmake/panda3d-patches/`) fix what that needed: shadow-map depth textures on ES, keeping
   the GL context while the app is in the background, asking for an ES 3 context,
-  `ALooper_pollAll` (gone from current NDKs), and a failed internal check logging instead
-  of closing the app. The shaders are the same files: on OpenGL ES the GLSL 1.50 source is
-  compiled as GLSL ES 3.00, which only needs another version line and precisions. The
-  shadow map is 1024².
+  `ALooper_pollAll` (gone from current NDKs), a failed internal check logging instead of
+  closing the app, and full precision in Panda's built-in shader (what draws everything
+  with shaders off: the player's ring, the glows, text). Its `mediump` is 16 bits on phone
+  GPUs (Mali, Adreno), too coarse for positions: flat effects a few centimetres above the
+  ground showed through it there, though not on PCs or emulators. The shaders are the same
+  files: on OpenGL ES the GLSL 1.50 source is compiled as GLSL ES 3.00, which only needs
+  another version line and precisions. The shadow map is 1024².
+* **Full screen:** immersive mode hides the navigation buttons and the status bar (a swipe
+  from the edge shows them for a moment), and the game also draws beside a camera cutout.
+  Android only lets its UI thread do that, so `AndroidMain.cpp` has the activity's entry
+  point (`ANativeActivity_onCreate`, calling the app glue's under another name) and hooks
+  the activity's resume and focus callbacks, which run there.
 * **Controls:** the touch controls above, sized for the screen (the 2D interface grows on
   small screens).
-* **Connect screen:** servers on the same network appear by themselves. A probe on UDP
-  4400 is answered by `server/arena/discovery.py`; replies are never larger than the probe
-  and are rate-limited, so the port cannot amplify floods. Otherwise type the address on the
-  keypad (`192.168.1.20` or `host:port`). The last server and your name are remembered.
+* **Connect screen** (also the menu, on Back, over the game): servers on the same network
+  appear by themselves. A probe on UDP 4400 is answered by `server/arena/discovery.py`;
+  replies are never larger than the probe and are rate-limited, so the port cannot amplify
+  floods. Otherwise tap the address field and type on the phone's keyboard: an address or a
+  host name (`192.168.1.20`, `arena.example.com`, `arena.example.com:4401`); Enter or PLAY
+  joins. The server you are on shows RESUME instead: still connected, nothing to join. The
+  last server and your name are remembered. (NativeActivity's view cannot take the focus
+  on its own, and the keyboard only comes up for the focused view, so `AndroidMain.cpp`
+  makes it focusable, also in touch mode.)
 * **Resources:** `arena.pak` ships inside the APK (`assets/`) and is decrypted in memory
   like on the PC.
-* **In the background** (Home, the app switcher) the game stops drawing as soon as Android
-  pauses it, before the window's surface goes away, and stays connected; it draws again
-  when it is back on screen.
+* **In the background** (Home, the app switcher, the screen off) the game stops drawing as
+  soon as Android pauses it, before the window's surface goes away, and stays connected
+  for 15 s. Back within that time, the game simply goes on; later, it has left the server
+  and joins it again by itself. The server drops a player it has not heard from for 15 s
+  (clients ping every 2 s), e.g. a phone that Android froze in the background.
+* **Only in the Android build:** the touch controls, the connect screen, LAN discovery,
+  settings and Android's input and lifecycle (`ARENA_PHONE_SOURCES`, `AndroidMain.cpp`,
+  `Platform.cpp` in `CMakeLists.txt`; the code using them in `App.cpp` and `Hud.cpp` is
+  `#ifdef __ANDROID__`). The PC client has none of it; the unit tests still build the
+  platform-independent parts on the PC.
 
 What you need, once (easiest with [Android Studio](https://developer.android.com/studio):
 *Tools → SDK Manager*):
@@ -203,9 +224,10 @@ configure again.
   sign with your own key: `-DARENA_ANDROID_KEYSTORE=release.keystore
   -DARENA_ANDROID_KEY_ALIAS=<alias>`, with the password in the `ARENA_KEYSTORE_PASS`
   environment variable.
-* Try the phone version on a PC: `arena_client --touch` shows the connect screen and the
-  touch controls (the mouse is the finger, Esc is Back). `--preset linux-gles` builds the
-  Linux client with the OpenGL ES renderer Android uses (EGL; Mesa runs it everywhere).
+* `--preset linux-gles` builds the Linux client with the OpenGL ES renderer Android uses
+  (EGL; Mesa runs it everywhere), to try that renderer on a PC.
+* The build folder remembers the NDK it found (`ARENA_ANDROID_NDK`), so later builds work
+  from a console without `ANDROID_HOME` or `ANDROID_NDK_HOME`.
 
 ### Build notes
 
@@ -459,7 +481,7 @@ Server (`server/arena/server_repository.py`, a hardened `ServerRepository`):
 * every generate and update is validated against the DC file before it is relayed. Peers
   never receive malformed data, and the stock server's crash bugs on unknown
   class/field/target are gone;
-* per-client message and byte rate limits, a 4 KB message cap, a 5 s hello timeout, a 20 s
+* per-client message and byte rate limits, a 4 KB message cap, a 5 s hello timeout, a 15 s
   idle timeout, a max player count, and a cap on pending connections;
 * a send timeout on every socket, so a client that stops reading is dropped instead of
   blocking the server;
@@ -591,8 +613,7 @@ players; `arena_client --headless` runs C++ bots.
 
 `--host`, `--port`, `--name` (max 16 bytes), `--color 0-11`, `--size WxH`, `--fullscreen`,
 `--zoom 0.55-1.6`, `--no-shadows`, `--no-msaa`, `--no-vsync`, `--low`, `--no-reconnect`,
-`--pack FILE`, `--dc-dir DIR`, `--touch` (touch controls, and the connect screen unless
-`--host` is given), `--ui-scale 0.8-2`.
+`--pack FILE`, `--dc-dir DIR`.
 Automation: `--headless`, `--bot`, `--duration S`, `--screenshot FILE` (after
 `--screenshot-after S`), `--say TEXT`, `--expect-players N`, `--trace FILE`. The client prints a
 `summary:` line on exit. Exit codes: 0 ok, 1 init failed, 2 never joined, 3 fewer players

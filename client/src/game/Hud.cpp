@@ -13,6 +13,16 @@ namespace arena::game {
 
 namespace {
 
+#ifdef __ANDROID__
+// Touch screens: other hints, chat higher up (the stick is bottom left), no
+// dash bar (the dash button shows it).
+constexpr bool kTouch = true;
+const char *const kHint = "Stick: move  |  DASH button: dash  |  Two fingers: zoom  |  Back: menu";
+#else
+constexpr bool kTouch = false;
+const char *const kHint = "WASD move  |  Space dash  |  Enter chat  |  F1 help";
+#endif
+
 constexpr double kChatLife = 14.0;
 constexpr size_t kChatLines = 7;
 constexpr double kAnnounceLife = 4.0;
@@ -60,7 +70,7 @@ Hud::Hud(NodePath aspect2d) : aspect2d_(aspect2d) {
     chatNp_ = makeText("chat", 0.04f, TextNode::A_left, root_, chat_);
     chat_->set_wordwrap(34.0f);
     hintNp_ = makeText("hint", 0.036f, TextNode::A_center, root_, hint_);
-    hint_->set_text("WASD move  |  Space dash  |  Enter chat  |  F1 help");
+    hint_->set_text(kHint);
     hint_->set_text_color(LColor(0.8f, 0.85f, 0.95f, 0.75f));
     helpNp_ = makeText("help", 0.05f, TextNode::A_left, root_, help_);
     help_->set_text(kHelpText);
@@ -133,14 +143,6 @@ void Hud::setUiScale(float scale) {
     }
 }
 
-void Hud::setTouchMode(bool touch) {
-    touch_ = touch;
-    hint_->set_text(touch ? "Stick: move  |  DASH button: dash  |  Two fingers: zoom  |  Back: menu"
-                          : "WASD move  |  Space dash  |  Enter chat  |  F1 help");
-    if (touch) dashRoot_.hide();
-    layout();
-}
-
 void Hud::setVisible(bool visible) {
     if (visible) root_.show();
     else root_.hide();
@@ -165,7 +167,7 @@ void Hud::layout() {
     at(centerNp_, 0.0f, 0.15f);
     at(announceNp_, 0.0f, 1.0f - 0.34f * s);
     // On touch screens the stick is bottom left: chat goes higher.
-    at(chatNp_, -a + 0.04f * s, touch_ ? 0.42f : -0.5f);
+    at(chatNp_, -a + 0.04f * s, kTouch ? 0.42f : -0.5f);
     at(hintNp_, 0.0f, -1.0f + 0.04f * s);
     at(helpNp_, -0.62f * s, 0.55f);
     at(scoreRoot_, a - 0.05f * s, 1.0f - 0.08f * s);
@@ -202,7 +204,7 @@ void Hud::update(const HudState &state, double now) {
     if (state.scores.empty()) scoreRoot_.hide();
     else scoreRoot_.show();
 
-    if (state.showDash && !touch_) {
+    if (state.showDash && !kTouch) {
         dashRoot_.show();
         dashFill_.set_sx(std::max(0.001f, state.dashReady));
         dashFill_.set_color(state.dashReady >= 1.0f ? LColor(0.3f, 0.95f, 1.0f, 0.95f)

@@ -109,7 +109,7 @@ function(arena_link_panda3d target)
         target_link_options(${target} PRIVATE -static -static-libgcc -static-libstdc++)
     endif()
     if(ANDROID)
-        # NativeActivity looks this up in libarena.so (android_native_app_glue.c).
+        # NativeActivity looks this up in libarena.so (AndroidMain.cpp).
         target_link_options(${target} PRIVATE -Wl,-u,ANativeActivity_onCreate)
     endif()
 endfunction()
@@ -217,10 +217,8 @@ add_library(arena_net STATIC
     client/src/core/ChaCha20.cpp
     client/src/core/Log.cpp
     client/src/core/ResourcePack.cpp
-    client/src/core/Settings.cpp
     client/src/net/ClockDelta.cpp
     client/src/net/ClientRepository.cpp
-    client/src/net/LanDiscovery.cpp
     client/src/net/TimeManager.cpp
 )
 target_include_directories(arena_net PUBLIC client/src PRIVATE ${CMAKE_BINARY_DIR}/generated)
@@ -231,10 +229,8 @@ arena_compile_options(arena_net)
 set(ARENA_CLIENT_SOURCES
     client/src/app/App.cpp
     client/src/app/Options.cpp
-    client/src/app/Platform.cpp
     client/src/game/ArenaGame.cpp
     client/src/game/ArenaPlayer.cpp
-    client/src/game/ConnectScreen.cpp
     client/src/game/DeadReckoning.cpp
     client/src/game/GameClient.cpp
     client/src/game/Hud.cpp
@@ -242,13 +238,23 @@ set(ARENA_CLIENT_SOURCES
     client/src/game/Movement.cpp
     client/src/game/RemoteMotion.cpp
     client/src/game/Scenery.cpp
-    client/src/game/TouchControls.cpp
     client/src/game/World.cpp
+)
+# Phones only: the touch controls, the connect screen with servers found on
+# the network, remembered settings, and Android's input and lifecycle (the
+# code that uses them in App.cpp is #ifdef __ANDROID__). The unit tests also
+# build the platform-independent ones, on the PC.
+set(ARENA_PHONE_SOURCES
+    client/src/core/Settings.cpp
+    client/src/game/ConnectScreen.cpp
+    client/src/game/TouchControls.cpp
+    client/src/net/LanDiscovery.cpp
 )
 if(ANDROID)
     # Android runs the game as a library: NativeActivity loads libarena.so and
     # android_main() (AndroidMain.cpp) starts it; see android/.
-    add_library(arena_client SHARED ${ARENA_CLIENT_SOURCES} client/src/app/AndroidMain.cpp)
+    add_library(arena_client SHARED ${ARENA_CLIENT_SOURCES} ${ARENA_PHONE_SOURCES}
+                client/src/app/AndroidMain.cpp client/src/app/Platform.cpp)
     set_target_properties(arena_client PROPERTIES OUTPUT_NAME arena)
 else()
     add_executable(arena_client client/src/main.cpp ${ARENA_CLIENT_SOURCES})
@@ -345,12 +351,11 @@ if(ARENA_BUILD_TESTS)
         client/tests/TouchTests.cpp
         client/src/game/ArenaGame.cpp
         client/src/game/ArenaPlayer.cpp
-        client/src/game/ConnectScreen.cpp
         client/src/game/DeadReckoning.cpp
         client/src/game/Meshes.cpp
         client/src/game/Movement.cpp
         client/src/game/RemoteMotion.cpp
-        client/src/game/TouchControls.cpp
+        ${ARENA_PHONE_SOURCES}
     )
     target_link_libraries(arena_tests PRIVATE arena_net)
     arena_link_panda3d(arena_tests)

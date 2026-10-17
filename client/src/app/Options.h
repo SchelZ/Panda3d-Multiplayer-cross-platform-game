@@ -1,4 +1,5 @@
-// Command-line options of arena_client.
+// Command-line options of arena_client (Android has no command line: its
+// AndroidMain.cpp sets the few that differ).
 #pragma once
 
 #include <cstdint>
@@ -9,7 +10,6 @@ namespace arena {
 struct Options {
     std::string host = "127.0.0.1";
     uint16_t port = 4400;
-    bool hostGiven = false;    // --host was on the command line
     std::string name;          // empty = random "Player123"
     int color = -1;            // -1 = random
     std::string pack;          // empty = <exe dir>/arena.pak
@@ -25,11 +25,6 @@ struct Options {
     bool vsync = true;
     bool lowQuality = false;   // fixed-function lighting, no shadows, no MSAA
     float zoom = 1.0f;         // initial camera zoom (0.55 close .. 1.6 far)
-
-    // Touch screens (always on Android): on-screen stick and dash button, and
-    // without --host the connect screen first. On a PC the mouse is the finger.
-    bool touch = false;
-    float uiScale = 0.0f;      // 2D interface size; 0 = the platform's choice
 
     // Automation (tests, load, screenshots).
     bool headless = false;     // no window at all

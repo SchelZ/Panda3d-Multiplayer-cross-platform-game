@@ -45,7 +45,8 @@ else()
 endif()
 
 # Small, idempotent source patches (MinGW portability); see cmake/panda3d-patches/.
-file(GLOB _p3_patches "${CMAKE_CURRENT_LIST_DIR}/panda3d-patches/*.patch")
+# CONFIGURE_DEPENDS: a new patch re-runs this (and applies it) on the next build.
+file(GLOB _p3_patches CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/panda3d-patches/*.patch")
 list(SORT _p3_patches)
 find_package(Git QUIET)
 foreach(_patch IN LISTS _p3_patches)
@@ -383,6 +384,10 @@ elseif(ANDROID)
         panda/src/androiddisplay/p3androiddisplay_composite1.cxx
         panda/src/android/android_native_app_glue.c
         DEFINES OPENGLES_2 HAVE_EGL)
+    # The game's ANativeActivity_onCreate (client/src/app/AndroidMain.cpp)
+    # calls the glue's under this name, then hides the system bars.
+    set_source_files_properties("${_p3src}/panda/src/android/android_native_app_glue.c" PROPERTIES
+        COMPILE_DEFINITIONS "ANativeActivity_onCreate=arena_glue_onCreate")
 else()
     _p3_module(p3x11display PANDAX11 SOURCES panda/src/x11display/p3x11display_composite1.cxx
         DEFINES USE_X11)

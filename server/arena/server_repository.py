@@ -76,7 +76,7 @@ class ArenaServerRepository(ServerRepository):
 
     # Limits for player connections. The AI connection is exempt.
     HELLO_TIMEOUT = 5.0           # seconds to send a valid hello
-    IDLE_TIMEOUT = 20.0           # clients ping every 2 s
+    IDLE_TIMEOUT = 15.0           # clients ping every 2 s: silent this long (a frozen or lost phone), gone
     MAX_DATAGRAM = 4096           # biggest legal player message is ~300 bytes
     MSG_RATE, MSG_BURST = 120.0, 360.0
     BYTE_RATE, BYTE_BURST = 32768.0, 98304.0

@@ -1,5 +1,5 @@
-// On-screen controls for touch screens (phones, tablets; --touch on a PC,
-// where the mouse is the finger). Drawn in aspect2d:
+// On-screen controls for touch screens (Android phones and tablets). Drawn
+// in aspect2d:
 //  - bottom left: the stick, always in the same place. A thumb that lands on
 //    it (or close to it) moves the knob; the ring stays put. The direction
 //    counts, not how far: like the keys, the player always runs at full speed

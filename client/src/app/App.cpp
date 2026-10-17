@@ -1,15 +1,17 @@
 #include "app/App.h"
 
-#include "app/Platform.h"
 #include "core/Log.h"
 #include "core/ResourcePack.h"
-#include "core/Settings.h"
-#include "game/ConnectScreen.h"
 #include "game/GameClient.h"
 #include "game/Hud.h"
-#include "game/TouchControls.h"
 #include "game/World.h"
+#ifdef __ANDROID__
+#include "app/Platform.h"
+#include "core/Settings.h"
+#include "game/ConnectScreen.h"
+#include "game/TouchControls.h"
 #include "net/LanDiscovery.h"
+#endif
 
 #include "antialiasAttrib.h"
 #include "clockObject.h"
@@ -33,6 +35,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <utility>
 
 #ifdef ARENA_GLES
 // Static builds: PandaFramework only knows desktop OpenGL; the OpenGL ES
@@ -60,8 +63,13 @@ void initGraphicsModules() {
 #endif
 }
 
+#ifdef __ANDROID__
 // Give up on a server that never answered and go back to the connect screen.
 constexpr double kJoinTimeout = 15.0;
+// In the background (Home, another app, the screen off) the game stays
+// connected this long, then leaves the server; back on screen, it joins again.
+constexpr double kAwayTimeout = 15.0;
+#endif
 
 struct AppState {
     Options options;
@@ -78,14 +86,19 @@ struct AppState {
     bool shadersVerified = false;
     bool quit = false;
 
-    // Touch screens and the connect screen (Options::touch).
+#ifdef __ANDROID__
+    // The phone: touch controls, and the connect screen (its menu).
     std::unique_ptr<game::TouchControls> touch;
-    std::unique_ptr<game::ConnectScreen> menu;  // only where there is no --host
+    std::unique_ptr<game::ConnectScreen> menu;
     net::LanDiscovery discovery;
     std::unique_ptr<core::Settings> settings;
     float uiScale = 1.0f;
-    bool mouseFingerDown = false;  // --touch on a PC: the mouse is finger 0
     double gameStartedAt = 0.0;
+    std::string server;        // the address of the game (as typed or picked)
+    double hiddenSince = -1.0;  // in the background since (-1: on screen)
+    std::string rejoin;        // left while away: join again when back
+    std::vector<platform::Touch> touches;  // this frame's
+#endif
     // What the last game left behind, for the summary line and exit code.
     game::GameClient::Counters counters;
     game::GameClient::Phase phase = game::GameClient::Phase::Offline;
@@ -93,6 +106,16 @@ struct AppState {
 };
 
 long frameCount() { return ClockObject::get_global_clock()->get_frame_count(); }
+
+// The phone's menu (the connect screen) is open, maybe over a game (never on
+// the PC).
+bool inMenu(const AppState &app) {
+#ifdef __ANDROID__
+    return app.menu && app.menu->visible();
+#else
+    return false;
+#endif
+}
 
 // Panda3D's configuration (PRC), built in. Only what changes something for
 // this game is set: Panda's defaults already suit most variables (the state
@@ -193,6 +216,7 @@ bool mountResources(Options &o) {
         if (o.dcDir.empty()) o.resourceDcDir = std::string(core::kPackMount) + "/dc";
         o.resourceShaderDir = std::string(core::kPackMount) + "/shaders";
     };
+#ifdef __ANDROID__
     std::string bundled;
     if (o.pack.empty() && platform::readBundledFile("arena.pak", bundled)) {
         std::string error;
@@ -204,6 +228,7 @@ bool mountResources(Options &o) {
         usePack();
         return true;
     }
+#endif
 
     VirtualFileSystem *vfs = VirtualFileSystem::get_global_ptr();
     const Filename exeDir = Filename::from_os_specific(ExecutionEnvironment::get_binary_name()).get_dirname();
@@ -269,9 +294,11 @@ bool startGame(AppState &app, std::string &error) {
         return false;
     }
     app.game->start();
+#ifdef __ANDROID__
     app.gameStartedAt = ClockObject::get_global_clock()->get_frame_time();
     if (app.hud) app.hud->setVisible(true);
     if (app.touch) app.touch->setVisible(true);
+#endif
     return true;
 }
 
@@ -283,6 +310,14 @@ void stopGame(AppState &app) {
     if (app.world) app.world->clear();
 }
 
+#ifdef __ANDROID__
+// ------------------------------------------------------- the phone's menu
+//
+// The connect screen is the phone's menu. Back opens it over the game, which
+// goes on behind it, still connected; Back or RESUME (the same server) returns
+// to the game, and only joining another server leaves it. Without a game (at
+// the start, or after a server sent us away) Back there closes the app.
+
 // A meadow to look at behind the connect screen, until a server sends its own.
 void showMenuScenery(AppState &app) {
     if (!app.world) return;
@@ -292,36 +327,157 @@ void showMenuScenery(AppState &app) {
 }
 
 void openMenu(AppState &app, const std::string &message) {
-    stopGame(app);
     if (!app.menu) return;
-    if (app.hud) {
-        app.hud->reset();  // no scores or chat from the last game
-        app.hud->setVisible(false);
+    if (app.touch) {
+        app.touch->releaseAll();
+        app.touch->setVisible(false);
     }
-    if (app.touch) app.touch->setVisible(false);
+    if (app.hud) app.hud->setVisible(false);
+    app.menu->setCurrentServer(app.game ? app.server : std::string());
+    app.menu->setMessage(!message.empty() || !app.game
+                             ? message
+                             : "Still playing on " + app.server + ": RESUME or Back returns to the game.");
     app.menu->setVisible(true);
-    app.menu->setMessage(message.empty() ? "Looking for servers on this network..." : message);
     app.discovery.start();
 }
 
-void joinFromMenu(AppState &app, const std::string &address) {
+void closeMenu(AppState &app) {
+    if (!app.menu) return;
+    app.menu->setVisible(false);
+    app.discovery.stop();
+    platform::showKeyboard(false);
+    if (app.game) {
+        if (app.hud) app.hud->setVisible(true);
+        if (app.touch) app.touch->setVisible(true);
+    }
+}
+
+// The game is over (the server sent us away, or never answered): the menu.
+void leaveGame(AppState &app, const std::string &message) {
+    stopGame(app);
+    if (app.hud) app.hud->reset();  // no scores or chat from the last game
+    openMenu(app, message);
+}
+
+void joinServer(AppState &app, const std::string &address) {
     std::string host;
     uint16_t port = 0;
     if (!game::ConnectScreen::parseAddress(address, host, port)) return;
+    if (app.game && game::ConnectScreen::sameServer(address, app.server)) {
+        closeMenu(app);  // already there, and still connected
+        return;
+    }
+    if (app.game) {
+        LOG_INFO("leaving %s for %s", app.server.c_str(), address.c_str());
+        stopGame(app);
+        if (app.hud) app.hud->reset();
+    }
     app.options.host = host;
     app.options.port = port;
+    app.server = address;
     if (app.settings) {
         app.settings->set("server", address);
         app.settings->save();
     }
-    app.discovery.stop();
-    app.menu->setVisible(false);
+    closeMenu(app);
     std::string error;
     if (!startGame(app, error)) {
         LOG_ERROR("%s", error.c_str());
-        openMenu(app, error);
+        leaveGame(app, error);
     }
 }
+
+void menuFrame(AppState &app, double now, float dt) {
+    for (const platform::Touch &t : app.touches) app.menu->handle(t);
+    // The phone's keyboard: up when the address field is tapped, away when
+    // the typing is done (or the app went to the background).
+    app.menu->type(platform::takeTyped());
+    if (!platform::visible()) app.menu->stopEditing();
+    if (app.menu->takeKeyboardRequest()) platform::showKeyboard(true);
+    if (!app.menu->editing() && platform::keyboardShown()) platform::showKeyboard(false);
+
+    if (app.discovery.update(now)) app.menu->setServers(app.discovery.servers());
+    app.menu->update(now);
+    if (!app.game && app.world) {
+        // The camera drifts slowly around the meadow (a game moves it itself).
+        const float a = static_cast<float>(now) * 0.05f;
+        app.world->update(now, dt, true, std::cos(a) * 8.0f, std::sin(a) * 8.0f);
+    }
+    std::string address;
+    if (app.menu->takeJoin(address)) {
+        joinServer(app, address);
+    } else if (platform::takeBack()) {
+        if (app.game) closeMenu(app);  // back to the game
+        else app.quit = true;
+    }
+}
+
+// The touch controls steer: not while the menu is open (the game goes on
+// behind it, standing still), nor in the background.
+void phoneControls(AppState &app, game::PlayerInput &input, bool controls) {
+    if (controls && app.touch) {
+        for (const platform::Touch &t : app.touches) app.touch->handle(t);
+        const game::TouchControls::Output out = app.touch->take();
+        if (out.x != 0.0f || out.y != 0.0f) {
+            input.x = out.x;
+            input.y = out.y;
+        }
+        input.dash = input.dash || out.dash;
+        if (out.zoomSteps != 0.0f && app.world) app.world->zoom(out.zoomSteps);
+        if (out.toggleStats && app.hud) app.hud->toggleStats();
+    }
+    if (!controls || !platform::visible()) input = game::PlayerInput();
+}
+
+// After the game's update: Back opens the menu over it; a server that sent
+// us away or never answered ends it.
+void phoneGameState(AppState &app, double now, bool controls) {
+    if (app.touch) app.touch->update(now, app.game->dashReady());
+    if (controls && platform::takeBack()) {
+        openMenu(app, "");
+    } else if (app.game->phase() == game::GameClient::Phase::Rejected) {
+        leaveGame(app, "The server said: " + app.game->rejectReason());
+    } else if (!app.game->counters().everPlayed && now - app.gameStartedAt > kJoinTimeout) {
+        leaveGame(app, "No answer from " + app.server + ". Is the server running, and on this network?");
+    }
+}
+
+// Android's part of each frame: this frame's touches, and in the background
+// (paused, or without a surface) nothing drawn or touched. Panda still reads
+// the window's events then, so it comes back. Away for longer than
+// kAwayTimeout, the game leaves its server; back on screen, it joins again.
+void phoneFrame(AppState &app, double now) {
+    app.touches = platform::takeTouches();
+    const bool visible = platform::visible();
+    if (app.window != nullptr) {
+        if (GraphicsWindow *win = app.window->get_graphics_window()) win->set_active(visible);
+    }
+    if (visible) {
+        app.hiddenSince = -1.0;
+        if (!app.rejoin.empty()) {
+            const std::string address = std::exchange(app.rejoin, std::string());
+            LOG_INFO("back: joining %s again", address.c_str());
+            joinServer(app, address);
+        }
+        return;
+    }
+    app.touches.clear();
+    if (app.touch) app.touch->releaseAll();
+    if (app.hiddenSince < 0.0) app.hiddenSince = now;
+    if (app.game && now - app.hiddenSince > kAwayTimeout) {
+        LOG_INFO("away for %.0f s: leaving %s", kAwayTimeout, app.server.c_str());
+        app.rejoin = app.server;
+        stopGame(app);
+        if (app.hud) app.hud->reset();
+    }
+    Thread::sleep(0.05);  // nothing is drawn: do not spin
+}
+
+std::string randomName() {
+    std::random_device rd;
+    return "Player" + std::to_string(std::uniform_int_distribution<int>(100, 999)(rd));
+}
+#endif  // __ANDROID__
 
 // ------------------------------------------------------------------ input
 
@@ -330,11 +486,13 @@ void onEscape(const Event *, void *data) {
     if (app->hud && app->hud->chatOpen()) {
         app->hud->closeChat();
         app->chatClosedFrame = frameCount();
-    } else if (app->menu) {
-        platform::pushBack();  // like Android's back button: game -> menu -> quit
-    } else {
-        app->quit = true;
+        return;
     }
+#ifdef __ANDROID__
+    platform::pushBack();  // a keyboard's Esc, like the back button: game -> menu -> quit
+#else
+    app->quit = true;
+#endif
 }
 
 void onEnter(const Event *, void *data) {
@@ -398,97 +556,26 @@ game::PlayerInput readInput(AppState &app) {
     return in;
 }
 
-#ifndef __ANDROID__
-// --touch on a PC: the left mouse button is a finger. Press and release come
-// from Panda's events (queued, so a quick click is not lost between frames);
-// while it is down, the finger follows the mouse.
-bool mousePixels(AppState &app, float &x, float &y) {
-    GraphicsWindow *win = app.window ? app.window->get_graphics_window() : nullptr;
-    if (app.mouse == nullptr || win == nullptr || !app.mouse->has_mouse() || !win->has_size()) return false;
-    const LPoint2 m = app.mouse->get_mouse();
-    x = (static_cast<float>(m[0]) + 1.0f) * 0.5f * win->get_x_size();
-    y = (1.0f - static_cast<float>(m[1])) * 0.5f * win->get_y_size();
-    return true;
-}
-
-void onMouseDown(const Event *, void *data) {
-    auto *app = static_cast<AppState *>(data);
-    float x, y;
-    if (!app->options.touch || app->mouseFingerDown || !mousePixels(*app, x, y)) return;
-    app->mouseFingerDown = true;
-    platform::pushTouch({platform::Touch::Kind::Down, 0, x, y});
-}
-
-void onMouseUp(const Event *, void *data) {
-    auto *app = static_cast<AppState *>(data);
-    if (!app->mouseFingerDown) return;
-    app->mouseFingerDown = false;
-    float x = 0, y = 0;
-    mousePixels(*app, x, y);
-    platform::pushTouch({platform::Touch::Kind::Up, 0, x, y});
-}
-
-void mouseAsFinger(AppState &app) {
-    float x, y;
-    if (app.mouseFingerDown && mousePixels(app, x, y)) {
-        platform::pushTouch({platform::Touch::Kind::Move, 0, x, y});
-    }
-}
-#endif
-
 // ------------------------------------------------------------------ frame
 
-void menuFrame(AppState &app, double now, float dt, const std::vector<platform::Touch> &touches) {
-    for (const platform::Touch &t : touches) app.menu->handle(t);
-    if (app.discovery.update(now)) app.menu->setServers(app.discovery.servers());
-    app.menu->update(now);
-    if (app.world) {
-        // The camera drifts slowly around the meadow.
-        const float a = static_cast<float>(now) * 0.05f;
-        app.world->update(now, dt, true, std::cos(a) * 8.0f, std::sin(a) * 8.0f);
-    }
-    std::string address;
-    if (app.menu->takeJoin(address)) joinFromMenu(app, address);
-    if (platform::takeBack()) app.quit = true;
-}
-
-void gameFrame(AppState &app, double now, double dt, const std::vector<platform::Touch> &touches) {
+// controls: false while the phone's menu is open over the game.
+void gameFrame(AppState &app, double now, double dt, bool controls) {
     game::PlayerInput input = readInput(app);
-    if (app.touch) {
-        for (const platform::Touch &t : touches) app.touch->handle(t);
-        const game::TouchControls::Output out = app.touch->take();
-        if (out.x != 0.0f || out.y != 0.0f) {
-            input.x = out.x;
-            input.y = out.y;
-        }
-        input.dash = input.dash || out.dash;
-        if (out.zoomSteps != 0.0f && app.world) app.world->zoom(out.zoomSteps);
-        if (out.toggleStats && app.hud) app.hud->toggleStats();
-    }
-    if (!platform::visible()) input = game::PlayerInput();  // in the background
+#ifdef __ANDROID__
+    phoneControls(app, input, controls);
+#endif
     app.game->update(now, dt, input);
-    if (app.touch) app.touch->update(now, app.game->dashReady());
-
-    if (app.menu) {
-        // Back, or a server that sent us away / never answered: the menu.
-        const auto phase = app.game->phase();
-        if (platform::takeBack()) {
-            openMenu(app, "");
-        } else if (phase == game::GameClient::Phase::Rejected) {
-            openMenu(app, "The server said: " + app.game->rejectReason());
-        } else if (!app.game->counters().everPlayed && now - app.gameStartedAt > kJoinTimeout) {
-            openMenu(app, "No answer from " + app.options.host + ":" + std::to_string(app.options.port) +
-                              ". Is the server running, and on this network?");
-        }
-    } else if (platform::takeBack()) {
-        app.quit = true;
-    }
+#ifdef __ANDROID__
+    phoneGameState(app, now, controls);
+#endif
 }
 
 AsyncTask::DoneStatus frameTask(GenericAsyncTask *, void *data) {
     auto &app = *static_cast<AppState *>(data);
+#ifdef __ANDROID__
     platform::frame();
     if (platform::quitRequested()) app.quit = true;
+#endif
     ClockObject *clock = ClockObject::get_global_clock();
     if (app.window == nullptr) {
         // Normally GraphicsEngine::render_frame() ticks the clock; headless
@@ -505,31 +592,21 @@ AsyncTask::DoneStatus frameTask(GenericAsyncTask *, void *data) {
             width = win->get_x_size();
             height = win->get_y_size();
             app.hud->setAspect(static_cast<float>(width) / height);
+#ifdef __ANDROID__
             if (app.touch) app.touch->setWindow(width, height, app.uiScale);
             if (app.menu) app.menu->setWindow(width, height, app.uiScale);
+#endif
         }
     }
-#ifndef __ANDROID__
-    if (app.options.touch) mouseAsFinger(app);
+#ifdef __ANDROID__
+    phoneFrame(app, now);
 #endif
-    std::vector<platform::Touch> touches = platform::takeTouches();
-    if (app.window != nullptr) {
-        // In the background (Android: paused, or without a surface) the window
-        // is not drawn; Panda still reads its events, so it comes back.
-        if (GraphicsWindow *win = app.window->get_graphics_window()) win->set_active(platform::visible());
-    }
-    if (!platform::visible()) {
-        touches.clear();
-        if (app.touch) app.touch->releaseAll();
-        // Nothing is drawn in the background: do not spin.
-        Thread::sleep(0.05);
-    }
-
-    if (app.game) {
-        gameFrame(app, now, dt, touches);
-    } else if (app.menu) {
-        menuFrame(app, now, static_cast<float>(dt), touches);
-    }
+    // The menu takes this frame's touches and back; a game goes on behind it.
+    const bool menuOpen = inMenu(app);
+#ifdef __ANDROID__
+    if (menuOpen) menuFrame(app, now, static_cast<float>(dt));
+#endif
+    if (app.game) gameFrame(app, now, dt, !menuOpen);
 
     if (app.world && !app.shadersVerified && clock->get_frame_count() > 2) {
         app.shadersVerified = true;  // shaders compile on first use: check once they did
@@ -542,7 +619,7 @@ AsyncTask::DoneStatus frameTask(GenericAsyncTask *, void *data) {
     }
     if (!o.screenshot.empty() && !app.screenshotTaken && app.window != nullptr &&
         ((app.game && app.game->playingSince() >= 0.0 && now - app.game->playingSince() >= o.screenshotAfter) ||
-         (!app.game && app.menu && now - app.startTime >= o.screenshotAfter))) {
+         (!app.game && inMenu(app) && now - app.startTime >= o.screenshotAfter))) {
         app.screenshotTaken = true;
         GraphicsWindow *win = app.window->get_graphics_window();
         const Filename file = Filename::from_os_specific(o.screenshot);
@@ -562,11 +639,6 @@ AsyncTask::DoneStatus frameTask(GenericAsyncTask *, void *data) {
     return AsyncTask::DS_cont;
 }
 
-std::string randomName() {
-    std::random_device rd;
-    return "Player" + std::to_string(std::uniform_int_distribution<int>(100, 999)(rd));
-}
-
 } // namespace
 
 int runApp(Options options, int argc, char **argv) {
@@ -577,23 +649,22 @@ int runApp(Options options, int argc, char **argv) {
     }
 
     auto app = std::make_unique<AppState>();
-    // Remembered between runs where there is no command line (Android).
+#ifdef __ANDROID__
+    // Remembered between runs (there is no command line): the last server,
+    // and the player's name, shown on the connect screen.
     const std::string settingsFile = platform::settingsFile();
     if (!settingsFile.empty()) {
         app->settings = std::make_unique<core::Settings>(settingsFile);
         app->settings->load();
+        options.name = app->settings->get("name");
         if (options.name.empty()) {
-            options.name = app->settings->get("name");
-            if (options.name.empty()) {
-                options.name = randomName();
-                app->settings->set("name", options.name);
-                app->settings->save();
-            }
+            options.name = randomName();
+            app->settings->set("name", options.name);
+            app->settings->save();
         }
     }
-    if (options.touch && options.name.empty()) {
-        options.name = randomName();  // shown on the connect screen
-    }
+    if (options.name.empty()) options.name = randomName();
+#endif
     app->options = options;
     initGraphicsModules();
     app->framework.open_framework(argc, argv);
@@ -633,6 +704,7 @@ int runApp(Options options, int argc, char **argv) {
         }
         options.msaa = false;
         LOG_INFO("window opened (OpenGL ES, no MSAA)");
+        platform::attachWindow();
 #else
         const bool configuredHardware = fb.get_force_hardware();
         struct Attempt {
@@ -666,7 +738,6 @@ int runApp(Options options, int argc, char **argv) {
             return kExitInitFailed;
         }
 #endif
-        platform::attachWindow();
         GraphicsWindow *win = app->window->get_graphics_window();
         if (win != nullptr) {
             LOG_INFO("renderer: %s", win->get_gsg()->get_driver_renderer().c_str());
@@ -715,19 +786,17 @@ int runApp(Options options, int argc, char **argv) {
         }
         app->world = std::make_unique<game::World>(render, app->window->get_camera_group(), ws);
         app->world->setZoom(options.zoom);
-        app->uiScale = options.uiScale > 0.0f ? options.uiScale : platform::uiScale();
         app->hud = std::make_unique<game::Hud>(app->window->get_aspect_2d());
-        app->hud->setUiScale(app->uiScale);
         app->mouse = DCAST(MouseWatcher, app->window->get_mouse().node());
-        if (options.touch) {
-            app->hud->setTouchMode(true);
-            app->touch = std::make_unique<game::TouchControls>(app->window->get_aspect_2d());
-            if (!options.hostGiven) {
-                std::string address = app->settings ? app->settings->get("server") : std::string();
-                app->menu = std::make_unique<game::ConnectScreen>(app->window->get_aspect_2d(), address,
-                                                                  options.name);
-            }
-        }
+#ifdef __ANDROID__
+        // The 2D interface sized for fingers, the touch controls, and the
+        // connect screen first.
+        app->uiScale = platform::uiScale();
+        app->hud->setUiScale(app->uiScale);
+        app->touch = std::make_unique<game::TouchControls>(app->window->get_aspect_2d());
+        const std::string address = app->settings ? app->settings->get("server") : std::string();
+        app->menu = std::make_unique<game::ConnectScreen>(app->window->get_aspect_2d(), address, options.name);
+#endif
 
         PandaFramework &fw = app->framework;
         void *data = app.get();
@@ -740,23 +809,19 @@ int runApp(Options options, int argc, char **argv) {
         fw.define_key("f11", "fullscreen", onFullscreen, data);
         fw.define_key("wheel_up", "zoom in", onWheelUp, data);
         fw.define_key("wheel_down", "zoom out", onWheelDown, data);
-#ifndef __ANDROID__
-        if (options.touch) {
-            fw.define_key("mouse1", "finger down", onMouseDown, data);
-            fw.define_key("mouse1-up", "finger up", onMouseUp, data);
-        }
-#endif
     }
 
+#ifdef __ANDROID__
     if (app->menu) {
         app->startTime = ClockObject::get_global_clock()->get_frame_time();
         showMenuScenery(*app);  // later the last server's arena stays behind the menu
         openMenu(*app, "");
-    } else {
+    }
+#endif
+    if (!inMenu(*app)) {
         std::string error;
         if (!startGame(*app, error)) {
             LOG_ERROR("%s", error.c_str());
-            app->touch.reset();
             app->hud.reset();
             app->world.reset();
             app->framework.close_framework();
@@ -775,14 +840,23 @@ int runApp(Options options, int argc, char **argv) {
     }
 
     stopGame(*app);
+#ifdef __ANDROID__
+    const bool menuOnly = true;  // the phone's player leaves from its menu
+#else
+    const bool menuOnly = false;
+#endif
+#ifdef __ANDROID__
     app->discovery.stop();
+    platform::showKeyboard(false);
+#endif
     const auto counters = app->counters;
     const auto phase = app->phase;
     const std::string rejectReason = app->rejectReason;
-    const bool menuOnly = app->menu != nullptr;
     app->framework.get_task_mgr().remove(task);
+#ifdef __ANDROID__
     app->menu.reset();
     app->touch.reset();
+#endif
     app->hud.reset();
     app->world.reset();
     app->framework.close_framework();
@@ -801,7 +875,7 @@ int runApp(Options options, int argc, char **argv) {
     std::fflush(stdout);
 
     if (menuOnly) {
-        return kExitOk;  // the player left from the connect screen
+        return kExitOk;
     }
     if (phase == game::GameClient::Phase::Rejected) {
         LOG_ERROR("rejected by the server: %s", rejectReason.c_str());

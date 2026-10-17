@@ -1,0 +1,14 @@
+diff --git a/panda/src/glstuff/glGraphicsStateGuardian_src.cxx b/panda/src/glstuff/glGraphicsStateGuardian_src.cxx
+--- a/panda/src/glstuff/glGraphicsStateGuardian_src.cxx
++++ b/panda/src/glstuff/glGraphicsStateGuardian_src.cxx
+@@ -176,7 +176,9 @@
+   "out vec4 color;\n"
+ #else
+   "#version 100\n"
+-  "precision mediump float;\n"
++  // Positions at full precision: mediump is 16 bits on phone GPUs, which
++  // puts flat effects just above the ground (decals, glows) through it.
++  "precision highp float;\n"
+   "attribute vec4 p3d_Vertex;\n"
+   "attribute vec4 p3d_Color;\n"
+   "attribute vec4 p3d_MultiTexCoord0;\n"

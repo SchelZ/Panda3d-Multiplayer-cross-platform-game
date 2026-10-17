@@ -245,6 +245,15 @@ class ServerHardeningTest(unittest.TestCase):
         c = self.client()
         self.assertEqual(c.rejectCode(timeout=10), REJECT_TIMEOUT)
 
+    def test_silent_player_is_dropped_after_15_seconds(self):
+        # A phone frozen in the background, or gone: its player stays 15 s
+        # without a message (clients ping every 2 s), then the server drops it.
+        c = self.client()
+        c.join()
+        start = time.time()
+        self.assertEqual(c.rejectCode(timeout=25), REJECT_TIMEOUT)
+        self.assertGreaterEqual(time.time() - start, 14.5)
+
     # ---------------------------------------------------------- objects
 
     def test_player_can_join_and_sees_the_game(self):

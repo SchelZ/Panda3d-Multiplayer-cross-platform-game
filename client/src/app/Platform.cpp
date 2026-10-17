@@ -1,3 +1,5 @@
+// The queues between Android's input (AndroidMain.cpp, called from Panda's
+// event processing) and the game's frame (App.cpp).
 #include "app/Platform.h"
 
 #include <atomic>
@@ -8,6 +10,7 @@ namespace arena::platform {
 namespace {
 std::mutex g_mutex;
 std::vector<Touch> g_touches;
+std::string g_typed;
 std::atomic<bool> g_back{false};
 std::atomic<bool> g_visible{true};
 } // namespace
@@ -24,19 +27,22 @@ std::vector<Touch> takeTouches() {
     return out;
 }
 
+void pushTyped(char c) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_typed.size() < 256) g_typed += c;
+}
+
+std::string takeTyped() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    std::string out;
+    out.swap(g_typed);
+    return out;
+}
+
 void pushBack() { g_back = true; }
 bool takeBack() { return g_back.exchange(false); }
 
 void setVisible(bool visible) { g_visible = visible; }
 bool visible() { return g_visible; }
-
-#ifndef __ANDROID__
-void attachWindow() {}
-void frame() {}
-bool quitRequested() { return false; }
-float uiScale() { return 1.0f; }
-std::string settingsFile() { return {}; }
-bool readBundledFile(const std::string &, std::string &) { return false; }
-#endif
 
 } // namespace arena::platform

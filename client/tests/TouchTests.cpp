@@ -149,6 +149,88 @@ ARENA_TEST(connect_screen_parses_addresses) {
     CHECK(!game::ConnectScreen::parseAddress("1:2:3", host, port));
 }
 
+ARENA_TEST(connect_screen_types_on_the_phone_keyboard) {
+    NodePath root("aspect2d");
+    game::ConnectScreen screen(root, "", "Tester");
+    screen.setWindow(2000, 1000, 1.0f);
+    CHECK(!screen.editing());
+    CHECK(!screen.takeKeyboardRequest());
+
+    // Tapping the field starts typing and asks for the keyboard (once).
+    const Px f = pixels(screen.fieldCenter());
+    screen.handle({Kind::Down, 1, f.x, f.y});
+    screen.handle({Kind::Up, 1, f.x, f.y});
+    CHECK(screen.editing());
+    CHECK(screen.takeKeyboardRequest());
+    CHECK(!screen.takeKeyboardRequest());
+
+    // Host names in any case, one port, delete; spaces and symbols dropped.
+    screen.type("Arena.Example.com:50011\b\b0");
+    CHECK(screen.address() == "arena.example.com:5000");
+    screen.type(" /:");
+    CHECK(screen.address() == "arena.example.com:5000");
+    std::string address;
+    CHECK(!screen.takeJoin(address));
+
+    // Enter is Play: join, and the typing is over.
+    screen.type("\n");
+    CHECK(screen.takeJoin(address));
+    CHECK(address == "arena.example.com:5000");
+    CHECK(!screen.editing());
+
+    // Not an address: no join. A tap away from the field ends the typing.
+    screen.handle({Kind::Down, 2, f.x, f.y});
+    screen.handle({Kind::Up, 2, f.x, f.y});
+    CHECK(screen.takeKeyboardRequest());
+    for (int i = 0; i < 30; ++i) screen.type("\b");
+    CHECK(screen.address().empty());
+    screen.type("a..b\n");
+    CHECK(!screen.takeJoin(address));
+    screen.handle({Kind::Down, 3, f.x, f.y});
+    screen.handle({Kind::Up, 3, f.x, f.y});
+    CHECK(screen.editing());
+    screen.handle({Kind::Down, 4, 1000, 950});  // the bottom of the screen
+    CHECK(!screen.editing());
+}
+
+ARENA_TEST(connect_screen_resumes_the_current_server) {
+    CHECK(game::ConnectScreen::sameServer("10.0.0.5", "10.0.0.5:4400"));
+    CHECK(game::ConnectScreen::sameServer("Arena.Example.com:4401", "arena.example.com:4401"));
+    CHECK(!game::ConnectScreen::sameServer("10.0.0.5", "10.0.0.5:4401"));
+    CHECK(!game::ConnectScreen::sameServer("10.0.0.5", "10.0.0.6"));
+    CHECK(!game::ConnectScreen::sameServer("", ""));
+
+    NodePath root("aspect2d");
+    game::ConnectScreen screen(root, "192.168.1.20", "Tester");
+    TextNode *label = DCAST(TextNode, root.find("**/button-play/label").node());
+    CHECK(label->get_text() == "PLAY");
+    screen.setCurrentServer("192.168.1.20:4400");  // the game behind the menu
+    CHECK(label->get_text() == "RESUME");
+    screen.type("\b\b1");                           // another server
+    CHECK(label->get_text() == "PLAY");
+    screen.type("\b20");
+    CHECK(label->get_text() == "RESUME");
+    std::string address;
+    screen.type("\n");
+    CHECK(screen.takeJoin(address));  // the app sees it is the same one and resumes
+    CHECK(game::ConnectScreen::sameServer(address, "192.168.1.20"));
+    screen.setCurrentServer("");
+    CHECK(label->get_text() == "PLAY");
+
+    // The app's message stays while servers come and go.
+    TextNode *message = DCAST(TextNode, root.find("**/message").node());
+    screen.setMessage("Still playing");
+    net::LanDiscovery::Server srv;
+    srv.address = "10.0.0.9";
+    srv.port = 4400;
+    srv.name = "Meadow";
+    screen.setServers({srv});
+    CHECK(message->get_text() == "Still playing");
+    screen.setMessage("");
+    screen.setServers({});
+    CHECK(message->get_text() == "Looking for servers on this network...");
+}
+
 ARENA_TEST(lan_discovery_packets_match_the_server) {
     // server/arena/discovery.py: 64-byte probe, magic + version + nonce.
     const auto probe = net::LanDiscovery::makeProbe(0x11223344u);
