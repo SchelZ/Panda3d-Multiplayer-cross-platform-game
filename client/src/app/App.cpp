@@ -4,6 +4,7 @@
 #include "core/ResourcePack.h"
 #include "game/GameClient.h"
 #include "game/Hud.h"
+#include "game/SplashScreen.h"
 #include "game/World.h"
 #ifdef __ANDROID__
 #include "app/Platform.h"
@@ -78,6 +79,7 @@ struct AppState {
     std::unique_ptr<game::World> world;
     std::unique_ptr<game::Hud> hud;
     std::unique_ptr<game::GameClient> game;
+    std::unique_ptr<game::SplashScreen> splash;  // the engine's logo, at start-up
     MouseWatcher *mouse = nullptr;
     double startTime = 0.0;
     bool dashRequested = false;
@@ -215,6 +217,7 @@ bool mountResources(Options &o) {
     auto usePack = [&o]() {
         if (o.dcDir.empty()) o.resourceDcDir = std::string(core::kPackMount) + "/dc";
         o.resourceShaderDir = std::string(core::kPackMount) + "/shaders";
+        o.resourceFontDir = std::string(core::kPackMount) + "/fonts";
     };
 #ifdef __ANDROID__
     std::string bundled;
@@ -244,11 +247,13 @@ bool mountResources(Options &o) {
         return true;
     }
     LOG_WARN("no arena.pak next to the client: reading plain files (development build)");
-    for (const char *rel : {"shaders", "../client/shaders", "../../client/shaders", "../../../client/shaders"}) {
-        const Filename dir(exeDir, rel);
-        if (vfs->exists(Filename(dir, "world.vert"))) {
-            o.resourceShaderDir = dir.get_fullpath();
-            break;
+    for (const char *rel : {"", "../client/", "../../client/", "../../../client/"}) {
+        const Filename base(exeDir, rel);
+        if (o.resourceShaderDir.empty() && vfs->exists(Filename(base, "shaders/world.vert"))) {
+            o.resourceShaderDir = Filename(base, "shaders").get_fullpath();
+        }
+        if (o.resourceFontDir.empty() && vfs->exists(Filename(base, "fonts/Roboto-Bold.ttf"))) {
+            o.resourceFontDir = Filename(base, "fonts").get_fullpath();
         }
     }
     return true;
@@ -558,9 +563,10 @@ game::PlayerInput readInput(AppState &app) {
 
 // ------------------------------------------------------------------ frame
 
-// controls: false while the phone's menu is open over the game.
+// controls: false while the start-up logo or the phone's menu is over the game.
 void gameFrame(AppState &app, double now, double dt, bool controls) {
     game::PlayerInput input = readInput(app);
+    if (!controls) input = game::PlayerInput();
 #ifdef __ANDROID__
     phoneControls(app, input, controls);
 #endif
@@ -598,15 +604,23 @@ AsyncTask::DoneStatus frameTask(GenericAsyncTask *, void *data) {
 #endif
         }
     }
+    // The engine's logo, over everything until it has faded out (the game
+    // has loaded by now: this task only runs once runApp() is done).
+    const bool splashUp = app.splash != nullptr;
+    if (splashUp && !app.splash->update(clock->get_real_time(), true)) app.splash.reset();
 #ifdef __ANDROID__
     phoneFrame(app, now);
+    if (splashUp) {
+        app.touches.clear();  // nothing under the logo takes input
+        platform::takeBack();
+    }
 #endif
     // The menu takes this frame's touches and back; a game goes on behind it.
     const bool menuOpen = inMenu(app);
 #ifdef __ANDROID__
     if (menuOpen) menuFrame(app, now, static_cast<float>(dt));
 #endif
-    if (app.game) gameFrame(app, now, dt, !menuOpen);
+    if (app.game) gameFrame(app, now, dt, !menuOpen && !splashUp);
 
     if (app.world && !app.shadersVerified && clock->get_frame_count() > 2) {
         app.shadersVerified = true;  // shaders compile on first use: check once they did
@@ -691,10 +705,15 @@ int runApp(Options options, int argc, char **argv) {
         // Android: one attempt, and it has to work. The system hands its
         // window to the first one; Panda's Android window cannot open again
         // after a failed attempt (no APP_CMD_INIT_WINDOW arrives a second
-        // time, so it never gets a surface). So no MSAA, the closest config,
-        // and no insisting on "hardware" (Android decides that from the GPU's
-        // name afterwards; only the old PixelFlinger counts as software).
-        fb.set_multisamples(0);
+        // time, so it never gets a surface). So the closest config, and no
+        // insisting on "hardware" (Android decides that from the GPU's name
+        // afterwards; only the old PixelFlinger counts as software).
+        // 4x MSAA where the phone offers it (otherwise the closest config,
+        // without): phone GPUs (Mali, Adreno) draw the screen in tiles in
+        // on-chip memory and resolve the samples there, so smooth edges cost
+        // little, far less than an anti-aliasing post-process, which reads
+        // and writes the whole screen once more every frame.
+        fb.set_multisamples(options.msaa ? 4 : 0);
         fb.set_force_hardware(false);
         app->window = app->framework.open_window(props, closestFb);
         if (app->window == nullptr) {
@@ -702,8 +721,10 @@ int runApp(Options options, int argc, char **argv) {
             app->framework.close_framework();
             return kExitInitFailed;
         }
-        options.msaa = false;
-        LOG_INFO("window opened (OpenGL ES, no MSAA)");
+        const int samples = app->window->get_graphics_window()->get_fb_properties().get_multisamples();
+        options.msaa = samples > 1;
+        LOG_INFO("window opened (OpenGL ES, %s)", options.msaa ? (std::to_string(samples) + "x MSAA").c_str()
+                                                               : "no MSAA");
         platform::attachWindow();
 #else
         const bool configuredHardware = fb.get_force_hardware();
@@ -747,6 +768,18 @@ int runApp(Options options, int argc, char **argv) {
             std::ostringstream fbText;
             win->get_fb_properties().output(fbText);
             LOG_INFO("framebuffer: %s", fbText.str().c_str());
+        }
+        if (options.splash && win != nullptr) {
+            // The engine's logo first, then the slow part behind it (building
+            // the world, compiling the shaders on the first frames).
+            const int w = win->has_size() ? win->get_x_size() : options.width;
+            const int h = win->has_size() ? std::max(1, win->get_y_size()) : options.height;
+            app->splash = std::make_unique<game::SplashScreen>(
+                app->window->get_render_2d(), app->window->get_aspect_2d(), static_cast<float>(w) / h, h,
+                Filename(options.resourceFontDir, "Roboto-Bold.ttf"),
+                ClockObject::get_global_clock()->get_real_time());
+            // Two frames: the window is double-buffered.
+            for (int i = 0; i < 2; ++i) app->framework.get_graphics_engine()->render_frame();
         }
         app->window->enable_keyboard();
         app->window->set_background_type(WindowFramework::BT_other);
@@ -853,6 +886,7 @@ int runApp(Options options, int argc, char **argv) {
     const auto phase = app->phase;
     const std::string rejectReason = app->rejectReason;
     app->framework.get_task_mgr().remove(task);
+    app->splash.reset();
 #ifdef __ANDROID__
     app->menu.reset();
     app->touch.reset();

@@ -76,7 +76,13 @@ void TouchControls::setWindow(int width, int height, float uiScale) {
 
 void TouchControls::layout() {
     const float s = scale_, a = aspect_;
-    stickHome_ = LPoint2f(-a + 0.42f * s, -1.0f + 0.44f * s);
+    // Low, where the left thumb rests holding the phone sideways: on a
+    // 6.3" phone the centre is ~14 mm above the bottom edge and ~20 mm from
+    // the side, the ring ~5 mm above the edge (it was 20 mm and 12 mm, which
+    // felt high). Thumb-reach studies put the comfortable zone ~25-40 mm
+    // from where the thumb pivots, below the screen's corner, and advise
+    // against the very corner itself.
+    stickHome_ = LPoint2f(-a + 0.42f * s, -1.0f + 0.30f * s);
     dashCenter_ = LPoint2f(a - 0.36f * s, -1.0f + 0.4f * s);
     stick_.set_scale(s);
     stick_.set_pos(stickHome_[0], 0.0f, stickHome_[1]);

@@ -15,7 +15,7 @@ struct Options {
     std::string pack;          // empty = <exe dir>/arena.pak
     std::string dcDir;         // plain DC files instead of the pack (development)
     // Set by the app: where resources come from (Panda virtual file system paths).
-    std::string resourceDcDir, resourceShaderDir;
+    std::string resourceDcDir, resourceShaderDir, resourceFontDir;
 
     // Window / graphics.
     int width = 1280, height = 720;
@@ -36,6 +36,7 @@ struct Options {
     std::string say;           // send this chat line once after joining
     std::string trace;         // log true and displayed positions (netcode analysis)
     bool reconnect = true;
+    bool splash = true;        // the engine's logo at start-up
     bool verbose = false;
 
     // Returns false (and fills error, or sets showHelp) if parsing failed.

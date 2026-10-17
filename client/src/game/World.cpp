@@ -382,11 +382,18 @@ void World::addOrb(uint16_t id, const Orb &orb) {
     v.gem.set_light_off(1);
     v.gem.set_shader_off(1);
     v.gem.hide(kShadowMask);  // light does not cast shadows
+    v.gem.set_bin("fixed", 6);  // after the halos (bin 5), so it stays crisp in its own
     NodePath halo = v.bob.attach_new_node("halo");
     haloModel_.instance_to(halo);
-    halo.set_scale(size * 3.2f);
+    const float haloRadius = size * 3.2f;
+    halo.set_scale(haloRadius);
     halo.set_color(LColor(color[0], color[1], color[2], orb.kind ? 0.85f : 0.6f));
-    halo.set_billboard_point_eye();
+    // The halo is wider than the gem floats high: facing the camera through
+    // the gem, its lower part went into the ground, cut off along a hard
+    // line. Moved toward the camera by its radius (along the line of sight,
+    // so it stays round the gem), it is above the ground at every zoom; the
+    // gem, drawn after it, is not washed out by it.
+    halo.set_billboard_point_eye(haloRadius);
     // Its light on the grass.
     NodePath glow = v.root.attach_new_node("glow");
     discModel_.instance_to(glow);

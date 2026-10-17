@@ -422,10 +422,7 @@ void android_main(struct android_app *app) {
     ANativeActivity_setWindowFlags(app->activity, AWINDOW_FLAG_KEEP_SCREEN_ON, 0);
 
     arena::Options options;
-    // No MSAA: phone screens have tiny pixels, and multisampled EGL configs are
-    // where emulators (BlueStacks) and some drivers misbehave.
-    options.msaa = false;
-    options.fullscreen = true;
+    options.fullscreen = true;  // (and 4x MSAA where the phone has it: App.cpp)
     char arg0[] = "arena";
     char *argv[] = {arg0, nullptr};
     const int code = arena::runApp(options, 1, argv);

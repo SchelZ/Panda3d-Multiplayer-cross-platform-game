@@ -16,7 +16,7 @@
                  android:hasCode="false"
                  android:allowBackup="false"
                  android:extractNativeLibs="true"
-                 android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+                 android:theme="@style/Theme.Arena">
         <activity android:name="android.app.NativeActivity"
                   android:label="Panda Arena"
                   android:exported="true"

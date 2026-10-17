@@ -30,6 +30,7 @@ const char *Options::usage() {
            "  --name NAME          player name (max 16 bytes)\n"
            "  --color N            player color 0-11\n"
            "  --no-reconnect       do not reconnect after losing the server\n"
+           "  --no-splash          no engine logo at start-up\n"
            "  --pack FILE          resource pack (default: arena.pak next to the client)\n"
            "  --dc-dir DIR         plain direct.dc and arena.dc instead (development)\n"
            "\n"
@@ -170,6 +171,8 @@ bool Options::parse(int argc, char **argv, std::string &error, bool &showHelp) {
             trace = v;
         } else if (arg == "--no-reconnect") {
             reconnect = false;
+        } else if (arg == "--no-splash") {
+            splash = false;
         } else if (arg == "--verbose") {
             verbose = true;
         } else {

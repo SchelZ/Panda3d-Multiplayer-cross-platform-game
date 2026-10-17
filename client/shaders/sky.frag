@@ -48,5 +48,8 @@ void main() {
 
     float s = max(dot(d, normalize(sunDirWorld)), 0.0);
     color += sunColor * (pow(s, 900.0) * 3.0 + pow(s, 24.0) * 0.18 + pow(s, 4.0) * 0.06);
+    // Dithered by half a colour step: the long gradient shows no bands on
+    // 8-bit screens (phones especially).
+    color += (hash(gl_FragCoord.xy) - 0.5) / 255.0;
     p3d_FragColor = vec4(color, 1.0);
 }

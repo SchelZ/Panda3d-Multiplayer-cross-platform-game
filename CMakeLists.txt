@@ -238,6 +238,7 @@ set(ARENA_CLIENT_SOURCES
     client/src/game/Movement.cpp
     client/src/game/RemoteMotion.cpp
     client/src/game/Scenery.cpp
+    client/src/game/SplashScreen.cpp
     client/src/game/World.cpp
 )
 # Phones only: the touch controls, the connect screen with servers found on
@@ -272,6 +273,8 @@ endif()
 find_package(Python3 COMPONENTS Interpreter QUIET)
 file(GLOB ARENA_SHADERS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/client/shaders/*.vert
      ${CMAKE_CURRENT_SOURCE_DIR}/client/shaders/*.frag ${CMAKE_CURRENT_SOURCE_DIR}/client/shaders/*.glsl)
+# The start-up logo's font (Roboto Bold, cut down to the letters of "PANDA3D") and its licence.
+file(GLOB ARENA_FONTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/client/fonts/*)
 set(ARENA_PACK ${ARENA_BIN_DIR}/arena.pak)
 if(Python3_FOUND)
     add_custom_command(OUTPUT ${ARENA_PACK}
@@ -280,9 +283,10 @@ if(Python3_FOUND)
                 dc/direct.dc=${CMAKE_CURRENT_SOURCE_DIR}/common/direct.dc
                 dc/arena.dc=${CMAKE_CURRENT_SOURCE_DIR}/common/arena.dc
                 shaders/=${CMAKE_CURRENT_SOURCE_DIR}/client/shaders
-        COMMAND ${CMAKE_COMMAND} -E rm -rf ${ARENA_BIN_DIR}/dc ${ARENA_BIN_DIR}/shaders
+                fonts/=${CMAKE_CURRENT_SOURCE_DIR}/client/fonts
+        COMMAND ${CMAKE_COMMAND} -E rm -rf ${ARENA_BIN_DIR}/dc ${ARENA_BIN_DIR}/shaders ${ARENA_BIN_DIR}/fonts
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tools/make_pack.py ${CMAKE_CURRENT_SOURCE_DIR}/common/direct.dc
-                ${CMAKE_CURRENT_SOURCE_DIR}/common/arena.dc ${ARENA_SHADERS}
+                ${CMAKE_CURRENT_SOURCE_DIR}/common/arena.dc ${ARENA_SHADERS} ${ARENA_FONTS}
         COMMENT "Packing DC files and shaders into arena.pak"
         VERBATIM)
     add_custom_target(arena_pack ALL DEPENDS ${ARENA_PACK})
@@ -293,10 +297,11 @@ else()
     message(WARNING "Python 3 not found: the DC files and shaders are copied next to the "
                     "client unencrypted instead of packed into arena.pak")
     add_custom_command(TARGET arena_client POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory ${ARENA_BIN_DIR}/dc ${ARENA_BIN_DIR}/shaders
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${ARENA_BIN_DIR}/dc ${ARENA_BIN_DIR}/shaders ${ARENA_BIN_DIR}/fonts
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_CURRENT_SOURCE_DIR}/common/direct.dc
                 ${CMAKE_CURRENT_SOURCE_DIR}/common/arena.dc ${ARENA_BIN_DIR}/dc/
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${ARENA_SHADERS} ${ARENA_BIN_DIR}/shaders/
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${ARENA_FONTS} ${ARENA_BIN_DIR}/fonts/
         VERBATIM)
 endif()
 
@@ -348,6 +353,7 @@ if(ARENA_BUILD_TESTS)
         client/tests/ProtocolTests.cpp
         client/tests/DeadReckoningTests.cpp
         client/tests/ResourcePackTests.cpp
+        client/tests/SplashTests.cpp
         client/tests/TouchTests.cpp
         client/src/game/ArenaGame.cpp
         client/src/game/ArenaPlayer.cpp
@@ -355,11 +361,13 @@ if(ARENA_BUILD_TESTS)
         client/src/game/Meshes.cpp
         client/src/game/Movement.cpp
         client/src/game/RemoteMotion.cpp
+        client/src/game/SplashScreen.cpp
         ${ARENA_PHONE_SOURCES}
     )
     target_link_libraries(arena_tests PRIVATE arena_net)
     arena_link_panda3d(arena_tests)
     target_compile_definitions(arena_tests PRIVATE ARENA_COMMON_DIR="${CMAKE_CURRENT_SOURCE_DIR}/common"
+                               ARENA_FONT_FILE="${CMAKE_CURRENT_SOURCE_DIR}/client/fonts/Roboto-Bold.ttf"
                                ARENA_PACK_FILE="${ARENA_PACK}" ARENA_PACK_KEY="${ARENA_PACK_KEY}")
     arena_compile_options(arena_tests)
     add_test(NAME arena_tests COMMAND arena_tests)

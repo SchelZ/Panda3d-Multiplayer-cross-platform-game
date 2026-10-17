@@ -92,5 +92,8 @@ void main() {
     float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
     color = max(mix(vec3(luma), color, 0.95), 0.0);
     color = color / (1.0 + max(color - 0.85, 0.0));
-    p3d_FragColor = vec4(pow(color, vec3(1.0 / 2.2)), p3d_ColorScale.a);
+    // Dithered by half a colour step, against bands in the haze and shading
+    // on 8-bit screens.
+    color = pow(color, vec3(1.0 / 2.2)) + (hash(gl_FragCoord.xy) - 0.5) / 255.0;
+    p3d_FragColor = vec4(color, p3d_ColorScale.a);
 }

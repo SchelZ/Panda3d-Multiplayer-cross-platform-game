@@ -146,7 +146,7 @@ def adaptiveBackground(x, y):
 
 
 def writeIcons(resDir):
-    """Writes res/ (legacy and adaptive launcher icons); returns the files."""
+    """Writes res/ (legacy and adaptive launcher icons, and the theme); returns the files."""
     files = {
         'mipmap-xxxhdpi/ic_launcher.png': png(192, 192, render(192, legacyIcon)),
         'mipmap-xxxhdpi/ic_launcher_fg.png': png(432, 432, render(432, adaptiveForeground, 2)),
@@ -157,6 +157,17 @@ def writeIcons(resDir):
             b'    <background android:drawable="@mipmap/ic_launcher_bg" />\n'
             b'    <foreground android:drawable="@mipmap/ic_launcher_fg" />\n'
             b'</adaptive-icon>\n'),
+        # The window Android shows while the app starts (and Android 12's own
+        # splash behind the icon) in the engine logo's grey, which the game's
+        # first frame shows too (client/src/game/SplashScreen.h): no flash.
+        'values/theme.xml': (
+            b'<?xml version="1.0" encoding="utf-8"?>\n'
+            b'<resources>\n'
+            b'    <color name="splash_background">#FF252525</color>\n'
+            b'    <style name="Theme.Arena" parent="@android:style/Theme.NoTitleBar.Fullscreen">\n'
+            b'        <item name="android:windowBackground">@color/splash_background</item>\n'
+            b'    </style>\n'
+            b'</resources>\n'),
     }
     paths = []
     for rel, data in files.items():

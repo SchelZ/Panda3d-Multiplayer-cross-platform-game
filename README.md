@@ -296,7 +296,7 @@ texture files.
 | `text-minfilter linear_mipmap_linear`, `text-page-size 512 512` | small HUD text stays crisp instead of shimmering, and all its glyphs fit on one or two textures (fewer draw calls) |
 | `sleep-precision 0` with `clock-mode limited` | headless clients and phones sleep between frames instead of spinning the last 10 ms of each |
 | Android: one window attempt with `BF_fb_props_optional` | the closest framebuffer config is taken (a phone without 24-bit depth still opens); Panda's Android window cannot be opened a second time after a failed attempt |
-| Android: `clock-frame-rate 60`, no MSAA | 90/120 Hz phones draw half the frames, staying cool and at full clock speed; phone pixels are tiny, and multisampled EGL configs are where emulators such as BlueStacks misbehave |
+| Android: `clock-frame-rate 60`, 4x MSAA where the phone offers it | 90/120 Hz phones draw half the frames, staying cool and at full clock speed; phone GPUs (Mali, Adreno) draw in tiles in on-chip memory and resolve the samples there, so smooth edges cost little, far less than a post-process anti-aliasing pass (FXAA or a "denoise" filter reads and writes the whole screen again every frame). Without a 4x config the closest one is taken |
 
 OpenGL ES builds (Android, `linux-gles`) set `load-display pandagles2` with
 `aux-display pandagles` and `aux-display p3tinydisplay` as fallbacks, as Panda3D's Android
@@ -332,13 +332,16 @@ GLSL shaders (`client/shaders`, loaded from the pack), in the spirit of
   * a **rim light** that separates shapes;
   * **wind** that sways grass, ferns, flowers and leaves (per-vertex weights);
   * **distance haze** into the horizon colour;
-  * lighting in linear colour with a soft highlight shoulder.
-* **sky**: a dome with a blue-to-haze gradient, a sun with glow, and slow fbm clouds.
+  * lighting in linear colour with a soft highlight shoulder, and a dither of half a colour
+    step against banding on 8-bit screens.
+* **sky**: a dome with a blue-to-haze gradient (dithered too), a sun with glow, and slow fbm
+  clouds.
 
 The players are blocky characters with a visor and eyes, in their colour. Their walk cycle
 comes from how fast they are drawn moving: legs and arms swing, and the body bobs and
 leans into the run. Dashes stretch them and kick up dust, and hits flash them. Their bodies
-turn toward where they move like the local player's does. Gems float, spin and glow.
+turn toward where they move like the local player's does. Gems float, spin and glow (the
+halo faces the camera, moved toward it by its radius so the ground never cuts it).
 Butterflies flutter over the meadow and pollen drifts in the sun.
 
 Performance choices (as in the main project): static scenery is batched into two vertex
@@ -355,6 +358,49 @@ Window creation falls back from 4x MSAA, to no MSAA, to a software OpenGL frameb
 and remote desktops).
 
 ---
+
+### Start-up logo
+
+Like games made with Unreal show theirs, the client first shows the engine's logo: the
+Panda3D head and "PANDA3D" in white on the logo's grey (#252525), fading in, for at least
+1.8 s, then fading out (`client/src/game/SplashScreen.cpp`). The game loads behind it: the
+world is built, the shaders compile on the first frames, a joining client connects and the
+phone's menu looks for servers. Nothing under it takes input. `--no-splash` leaves it out
+(automation); headless clients never show it. On Android the window Android shows while
+the app starts is the same grey (`values/theme.xml`, written by `tools/make_apk.py`), so
+there is no flash between it and the logo.
+
+None of it is a picture, so it is sharp on any screen size and shape:
+
+* the head is polygons: traced from Panda3D's own icon (`panda/src/configfiles/pandaIcon.ico`
+  in the Panda3D repository, its 256 px image), mirrored and averaged (the logo is
+  symmetric), with the white outline the logo has on dark backgrounds. Two white shapes,
+  under 60 triangles, triangulated by Panda's `Triangulator` at start-up; the dark parts
+  are holes, so fading works over anything. Edges are smooth with MSAA (on by default on
+  PCs and phones);
+* the word is the logo's typeface, Roboto Bold (a Panda3D forum reply names it; its stem
+  weight matches the logo's), set as tightly as the logo, whose older Roboto was narrower.
+  Panda renders its glyphs with FreeType at exactly the size they are drawn, so they are
+  crisp from 720p to 4K. `client/fonts/Roboto-Bold.ttf` is cut down to the letters of the
+  word (2.8 KB; `pyftsubset Roboto-Bold.ttf --text="PANDA3D "`), Apache 2.0
+  (`client/fonts/LICENSE-Roboto.txt`), and ships in `arena.pak`;
+* the background is a plain card over the whole window.
+
+What the alternatives would cost (measured on the test machine; phones decode several
+times slower):
+
+| Splash | Memory on the GPU | Before the first frame | Sharpness |
+|---|---|---|---|
+| this one: polygons + font + card | under 60 triangles and one glyph page (512² at 1080p, 1 byte per texel: 0.25 MB) | a 2.8 KB font and a few hundred points to triangulate | exact at any size |
+| one image of logo and word, 1920x1080 | 7.9 MB (RGBA, +2.6 MB mipmaps) | decoding the PNG: 24 ms | soft on larger screens |
+| the same, 2560x1440 | 14.1 MB (+4.7 MB) | 49 ms | soft on 4K |
+| the same, 3840x2160 | 31.6 MB (+10.5 MB) | 111 ms | exact, but the most memory and the slowest start |
+
+A full-screen image also has to be letterboxed or cropped for every screen shape, and its
+decoding delays exactly the frame that should appear at once. The other resolution-
+independent way is a signed distance field texture (Valve, SIGGRAPH 2007): a small
+texture of distances to the edges, drawn with a threshold. It needs no MSAA for smooth
+edges, but a texture and a shader; for one flat logo the polygons are simpler and cheaper.
 
 ## How the networking works
 
@@ -613,7 +659,7 @@ players; `arena_client --headless` runs C++ bots.
 
 `--host`, `--port`, `--name` (max 16 bytes), `--color 0-11`, `--size WxH`, `--fullscreen`,
 `--zoom 0.55-1.6`, `--no-shadows`, `--no-msaa`, `--no-vsync`, `--low`, `--no-reconnect`,
-`--pack FILE`, `--dc-dir DIR`.
+`--pack FILE`, `--dc-dir DIR`, `--no-splash`.
 Automation: `--headless`, `--bot`, `--duration S`, `--screenshot FILE` (after
 `--screenshot-after S`), `--say TEXT`, `--expect-players N`, `--trace FILE`. The client prints a
 `summary:` line on exit. Exit codes: 0 ok, 1 init failed, 2 never joined, 3 fewer players
