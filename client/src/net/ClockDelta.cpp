@@ -1,5 +1,7 @@
 #include "net/ClockDelta.h"
 
+#include "net/Protocol.h"
+
 #include <algorithm>
 #include <cmath>
 
@@ -50,6 +52,17 @@ double ClockDelta::networkToLocalTime(int64_t networkTime, double now, int bits)
 int32_t ClockDelta::localToNetworkTime(double localTime, int bits) const {
     const int64_t ntime = static_cast<int64_t>(std::floor((localTime - delta_) * kTicksPerSec + 0.5));
     return bits == 16 ? signExtend16(ntime) : static_cast<int32_t>(ntime);
+}
+
+int64_t ClockDelta::localToStep(double localTime) const {
+    return static_cast<int64_t>(std::floor((localTime - delta_) * kStepsPerSec));
+}
+
+double ClockDelta::stepToLocalTime(int64_t step) const { return static_cast<double>(step) / kStepsPerSec + delta_; }
+
+int64_t ClockDelta::resolveStep(uint16_t step16, double now) const {
+    const int64_t near = localToStep(now);
+    return near + signExtend16(static_cast<int64_t>(step16) - near);
 }
 
 } // namespace arena::net

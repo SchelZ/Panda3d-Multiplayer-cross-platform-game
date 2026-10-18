@@ -139,16 +139,17 @@ void ClientRepository::disconnect() {
 }
 
 void ClientRepository::endSession(bool notifyLost) {
+    const bool wasConnected = state_ == State::Handshake || state_ == State::Ready;
+    state_ = State::Idle;  // first: objects going away must not send anything
     destroyAllObjects();
     if (conn_) {
         conn_->disconnect();
         conn_.reset();
     }
-    const bool wasConnected = state_ == State::Handshake || state_ == State::Ready;
-    state_ = State::Idle;
     doIdBase_ = doIdRange_ = nextDoId_ = 0;
     interestZones_.clear();
     clockDelta_.clear();
+    frames_.reset();
     if (notifyLost && wasConnected && onLost) {
         onLost();
     }
@@ -219,13 +220,13 @@ bool ClientRepository::sendPacked(const DCPacker &packer) {
     return sendDatagram(Datagram(packer.get_data(), packer.get_length()));
 }
 
-bool ClientRepository::sendMove(const WireState &state) {
+bool ClientRepository::sendInput(const InputCmd &input) {
     if (state_ != State::Ready) [[unlikely]] {
         return false;
     }
-    uint8_t buf[2 + WireState::kSize] = {static_cast<uint8_t>(CLIENT_MOVE & 0xff),
-                                        static_cast<uint8_t>(CLIENT_MOVE >> 8)};
-    state.encode(buf + 2);
+    uint8_t buf[2 + InputCmd::kSize] = {static_cast<uint8_t>(CLIENT_INPUT & 0xff),
+                                       static_cast<uint8_t>(CLIENT_INPUT >> 8)};
+    input.encode(buf + 2);
     return sendDatagram(Datagram(buf, sizeof buf));
 }
 
@@ -391,7 +392,7 @@ void ClientRepository::destroyAllObjects() {
 void ClientRepository::handleDatagram(DatagramIterator &di, unsigned int msgType) {
     currentSender_ = 0;
     switch (msgType) {
-    case SERVER_MOVES: handleMoves(di); break;  // the hot path
+    case SERVER_FRAME: handleFrame(di); break;  // the hot path
     case SET_DOID_RANGE_CMU: handleSetDoIdRange(di); break;
     case OBJECT_GENERATE_CMU: handleGenerate(di); break;
     case OBJECT_UPDATE_FIELD_CMU: handleUpdate(di); break;
@@ -628,22 +629,29 @@ void ClientRepository::handleRequestGenerates(DatagramIterator &di) {
     }
 }
 
-// uint8 count, count x (uint8 slot, 9-byte WireState). Checked as a whole first.
-void ClientRepository::handleMoves(DatagramIterator &di) {
+// Everything the AI has for us from one batch (net/Frame.h). Every frame is
+// decoded, in order: the next one may be coded against this one.
+void ClientRepository::handleFrame(DatagramIterator &di) {
     const auto *data = static_cast<const uint8_t *>(di.get_datagram().get_data()) + di.get_current_index();
-    const size_t size = di.get_remaining_size();
-    constexpr size_t kEntry = 1 + WireState::kSize;
-    if (size == 0 || size != 1 + data[0] * kEntry || state_ != State::Ready) [[unlikely]] {
+    if (!frames_.decode(data, di.get_remaining_size())) [[unlikely]] {
+        // Out of step with the server: nothing after this can be read right.
+        LOG_WARN("undecodable frame from %s, reconnecting", target_.c_str());
         ++stats_.dropped;
+        endSession(true);
         return;
     }
-    for (const uint8_t *e = data + 1, *end = data + size; e < end; e += kEntry) {
-        const WireState s = WireState::decode(e + 1);
-        if (e[0] == kNoSlot) [[unlikely]] {
-            ++stats_.dropped;
-            continue;
-        }
-        if (onMove) onMove(e[0], s);
+    if (state_ != State::Ready) [[unlikely]] {
+        return;
+    }
+    const uint16_t sent = frames_.sent();
+    for (const FrameDecoder::Sample &s : frames_.samples()) {
+        if (s.slot != kNoSlot && onMove) onMove(s.slot, s.state, sent);
+    }
+    for (const FrameEvent &e : frames_.events()) {
+        if (onEvent) onEvent(e);
+    }
+    if (const SelfState *own = frames_.self(); own != nullptr && onSelf && conn_) {
+        onSelf(*own);
     }
 }
 
@@ -657,6 +665,7 @@ void ClientRepository::handleSlots(DatagramIterator &di) {
     while (di.get_remaining_size() > 0) {
         const uint8_t slot = di.get_uint8();
         const uint32_t doId = di.get_uint32();
+        frames_.forget(slot);  // whoever is in it now, its samples start in full
         if (slot != kNoSlot && onSlot) onSlot(slot, doId);
     }
 }

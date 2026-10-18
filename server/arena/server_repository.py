@@ -14,13 +14,18 @@ be stalled by a client that stops reading. This subclass keeps its protocol
 * a send timeout on every socket, so a stalled client is dropped instead of
   blocking the server,
 * batched writes (collect-tcp) flushed once per tick,
-* compact binary movement (protocol.py): one-byte player slots, 9-byte
-  states, one SERVER_MOVES message per client per tick with the newest state
-  of every player that moved, and a cache so newcomers see everyone at once,
+* an authoritative AI (protocol.py): players' inputs (CLIENT_INPUT) go to
+  the AI only, batched once per tick; each batch from the AI (samples,
+  events, SELF) becomes one bit-packed SERVER_FRAME per client (frame.py),
+  one TCP packet; a cache of the newest sample per player so newcomers see
+  everyone at once,
+* an object's generate reaches each client once, not again whenever
+  someone else starts listening to its zone,
+* no client ever receives another client's address: everything is relayed,
+  and nothing relayed contains one,
 * no exception ever escapes into the task manager.
 """
 
-import collections
 import hmac
 import socket
 import struct
@@ -33,7 +38,7 @@ from direct.distributed.MsgTypesCMU import (
     CLIENT_DISCONNECT_CMU, CLIENT_OBJECT_GENERATE_CMU, CLIENT_OBJECT_UPDATE_FIELD,
     CLIENT_OBJECT_UPDATE_FIELD_TARGETED_CMU, CLIENT_SET_INTEREST_CMU,
     OBJECT_DELETE_CMU, OBJECT_DISABLE_CMU, OBJECT_GENERATE_CMU,
-    OBJECT_SET_ZONE_CMU, OBJECT_UPDATE_FIELD_CMU)
+    OBJECT_SET_ZONE_CMU, OBJECT_UPDATE_FIELD_CMU, REQUEST_GENERATES_CMU)
 from direct.distributed.PyDatagram import PyDatagram
 from direct.distributed.ServerRepository import ServerRepository
 from direct.task import Task
@@ -42,13 +47,14 @@ from panda3d.core import (
 from panda3d.direct import DCPacker
 
 from . import policy
+from .frame import (
+    BitWriter, FrameError, unpackAiEvents, writeEvent, writeHeader, writeSample, writeSelf)
 from .protocol import (
-    CLIENT_HELLO_ARENA, CLIENT_MOVE, FLAG_DASH, MAX_SLOTS, PROTOCOL_VERSION,
-    REJECT_BAD_DC_HASH, REJECT_BAD_TOKEN, REJECT_BAD_VERSION, REJECT_FLOOD,
-    REJECT_PROTOCOL_ERROR, REJECT_SERVER_FULL, REJECT_SHUTDOWN, REJECT_TIMEOUT,
-    ROLE_AI, ROLE_PLAYER, SERVER_MOVES, SERVER_REJECT_ARENA, SERVER_SLOTS, STATE_SIZE)
-
-_SLOT_ENTRY = struct.Struct('<BI')
+    AI_FRAME, AI_SLOT, AI_SLOT_MSG, CLIENT_HELLO_ARENA, CLIENT_INPUT, INPUT_SIZE, MOVE_ENTRY_SIZE,
+    NO_SLOT, PROTOCOL_VERSION, REJECT_BAD_DC_HASH, REJECT_BAD_TOKEN, REJECT_BAD_VERSION,
+    REJECT_FLOOD, REJECT_PROTOCOL_ERROR, REJECT_SERVER_FULL, REJECT_SHUTDOWN, REJECT_TIMEOUT,
+    ROLE_AI, ROLE_PLAYER, SELF_ENTRY_SIZE, SERVER_CLIENT_LEFT, SERVER_FRAME, SERVER_INPUTS,
+    SERVER_REJECT_ARENA, SERVER_SLOTS, SLOT_ENTRY, STATE, ZONE_ARENA)
 
 
 class ProtocolError(Exception):
@@ -82,6 +88,7 @@ class ArenaServerRepository(ServerRepository):
     BYTE_RATE, BYTE_BURST = 32768.0, 98304.0
     SEND_TIMEOUT = 0.25           # a client that does not drain its socket is dropped
     MAX_PENDING = 32              # connections that have not said hello yet
+    HAVE_TCP_INFO = sys.platform.startswith('linux') and hasattr(socket, 'TCP_INFO')
 
     class Client(ServerRepository.Client):
         def __init__(self, connection, netAddress, doIdBase):
@@ -94,8 +101,12 @@ class ArenaServerRepository(ServerRepository):
             self.lastRecv = now
             self.msgBucket = None
             self.byteBucket = None
-            self.slot = None          # movement slot of this client's player object
-            self.playerDoId = None
+            self.slot = None          # slot of this client's player (bound by the AI)
+            self.frameSent = None     # sent step of the last SERVER_FRAME to it
+            self.knownSlots = set()   # slots whose newest sample it has (a frame baseline)
+            self.bytesOut = 0         # everything sent to it, with the 2-byte length
+            self.packetsOut = 0       # TCP writes (one per tick with something to send)
+            self.tcpInfo = None       # (bytes out, bytes in, segments out, segments in)
 
         def __repr__(self):
             role = {ROLE_AI: 'ai', ROLE_PLAYER: 'player'}.get(self.role, 'pending')
@@ -110,13 +121,12 @@ class ArenaServerRepository(ServerRepository):
         self.maxPlayers = maxPlayers
         self.aiToken = aiToken
         self.aiClient = None
-        self.stats = {'msgsIn': 0, 'bytesIn': 0, 'msgsOut': 0, 'kicks': 0, 'moves': 0}
-        # Movement slots. Freed slots go to the back of the queue, so a slot is
-        # not reused while messages naming its previous player are in flight.
-        self.freeSlots = collections.deque(range(min(MAX_SLOTS, max(maxPlayers, 1) + 64)))
-        self.slotOwners = {}      # slot -> client
-        self.pendingMoves = {}    # slot -> newest state received this tick
-        self.lastStates = {}      # slot -> last relayed state (for clients entering a zone)
+        self.stats = {'msgsIn': 0, 'bytesIn': 0, 'msgsOut': 0, 'kicks': 0, 'inputs': 0, 'moves': 0}
+        # Player slots, bound by the AI (AI_SLOT).
+        self.slotOwners = {}      # slot -> the player's client
+        self.slotDoIds = {}       # slot -> the player's object (owned by the AI)
+        self.pendingInputs = []   # INPUT entries (slot + 5 bytes) for the AI, this tick
+        self.lastStates = {}      # slot -> (sent, frame baseline) of its newest sample
         try:
             ServerRepository.__init__(self, tcpPort, serverAddress=bindAddress or '0.0.0.0',
                                       dcFileNames=dcFileNames, threadedNet=threadedNet)
@@ -253,9 +263,49 @@ class ArenaServerRepository(ServerRepository):
         if client is self.aiClient:
             self.notify.warning('the AI repository disconnected')
             self.aiClient = None
-        self.notify.info('%s left (%s)' % (client, client.info or 'no hello'))
+        self.notify.info('%s left (%s)%s'
+                         % (client, client.info or 'no hello', self._traffic(client)))
+        for zoneId in client.currentInterestZoneIds:
+            for obj in self.objectsByZoneId.get(zoneId, ()):
+                self._seenBy(obj).discard(client)
         ServerRepository.handleClientDisconnect(self, client)
-        self._releaseSlot(client)
+        if client.slot is not None and self.slotOwners.get(client.slot) is client:
+            del self.slotOwners[client.slot]  # its player stays until the AI removes it
+        client.slot = None
+        if client.accepted and client.role == ROLE_PLAYER and self.aiClient is not None:
+            dg = PyDatagram()
+            dg.addUint16(SERVER_CLIENT_LEFT)
+            dg.addUint32(client.doIdBase)
+            self._send(self.aiClient, dg)
+
+    def _traffic(self, client):
+        """What we sent a player and what it sent us, for the log."""
+        if client.role != ROLE_PLAYER:
+            return ''
+        secs = max(1e-3, time.monotonic() - client.connectTime)
+        text = '; sent it %.0f B/s in %.1f packets/s' % (client.bytesOut / secs,
+                                                           client.packetsOut / secs)
+        if client.tcpInfo is not None:
+            # The kernel's count, with what the game does not see: TCP
+            # segments (each with 40-60 bytes of headers) and acknowledgements.
+            out, received, segsOut, segsIn = client.tcpInfo
+            text += '; TCP: out %.0f B/s in %.1f segments/s, in %.0f B/s in %.1f segments/s' % (
+                out / secs, segsOut / secs, received / secs, segsIn / secs)
+        return text
+
+    def _sampleTcpInfo(self, client):
+        """Linux only: the connection's byte and segment counters."""
+        try:
+            fd = client.connection.getSocket().GetSocket()
+            sock = socket.socket(fileno=fd)
+            try:
+                raw = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 144)
+            finally:
+                sock.detach()
+            if len(raw) >= 144:
+                client.tcpInfo = struct.unpack_from('<QQII', raw, 120)
+        except (OSError, ValueError, AttributeError, struct.error):
+            pass
 
     def shutdown(self, reason='server shutting down'):
         for client in list(self.clientsByConnection.values()):
@@ -266,12 +316,13 @@ class ArenaServerRepository(ServerRepository):
     # ------------------------------------------------------------ main loop
 
     def flushPending(self, task=None):
-        self._emitMoves()
+        self._emitInputs()
         if self.needsFlush:
             flush, self.needsFlush = self.needsFlush, set()
             for client in flush:
                 if client.connection in self.clientsByConnection:
                     client.connection.flush()
+                    client.packetsOut += 1
         return Task.cont
 
     def housekeeping(self, task):
@@ -293,6 +344,8 @@ class ArenaServerRepository(ServerRepository):
                         self.kick(client, REJECT_TIMEOUT, 'no hello received')
                 elif client.role == ROLE_PLAYER and now - client.lastRecv > self.IDLE_TIMEOUT:
                     self.kick(client, REJECT_TIMEOUT, 'connection timed out')
+                elif client.role == ROLE_PLAYER and self.HAVE_TCP_INFO:
+                    self._sampleTcpInfo(client)
         except Exception:
             self.notify.warning('housekeeping failed:\n' + traceback.format_exc())
         return Task.again
@@ -333,8 +386,16 @@ class ArenaServerRepository(ServerRepository):
             raise ProtocolError('empty message')
         msgType = dgi.getUint16()
 
-        if msgType == CLIENT_MOVE and client.accepted:
-            self._handleMove(client, dgi)  # by far the most frequent message
+        if msgType == CLIENT_INPUT and client.accepted:
+            self._handleInput(client, dgi)  # the most frequent player message
+            return
+        if msgType in (AI_FRAME, AI_SLOT):
+            if client is not self.aiClient:
+                raise ProtocolError('message %d is for the AI only' % msgType)
+            if msgType == AI_FRAME:
+                self._relayFrame(dgi)
+            else:
+                self._bindSlot(dgi)
             return
         if not client.accepted:
             if msgType == CLIENT_HELLO_ARENA:
@@ -445,9 +506,6 @@ class ArenaServerRepository(ServerRepository):
             client.objectsByZoneId.setdefault(zoneId, set()).add(obj)
             self.objectsByZoneId.setdefault(zoneId, set()).add(obj)
             self.updateClientInterestZones(client)
-            if not isAI and dclass.getName() == policy.SLOT_CLASS:
-                # Before the generate, so everyone can map the slot right away.
-                self._assignSlot(client, obj)
 
         dg = PyDatagram()
         dg.addUint16(OBJECT_GENERATE_CMU)
@@ -456,7 +514,21 @@ class ArenaServerRepository(ServerRepository):
         dg.addUint16(classId)
         dg.addUint32(doId)
         dg.appendData(payload)
-        self.sendToZoneExcept(zoneId, dg, [client])
+        # The owner sends an object again whenever someone starts listening to
+        # its zone (REQUEST_GENERATES_CMU); only those who lack it get it.
+        seenBy = self._seenBy(obj)
+        for other in self.zonesToClients.get(zoneId, ()):
+            if other is not client and other not in seenBy:
+                seenBy.add(other)
+                self._send(other, dg)
+
+    @staticmethod
+    def _seenBy(obj):
+        """The clients that have the object's generate (and no disable since)."""
+        seenBy = getattr(obj, 'seenBy', None)
+        if seenBy is None:
+            seenBy = obj.seenBy = set()
+        return seenBy
 
     def _validateGenerate(self, dclass, payload, isAI):
         """Checks the required + optional field blob of a generate message.
@@ -581,12 +653,10 @@ class ArenaServerRepository(ServerRepository):
         dg = PyDatagram()
         dg.addUint16(OBJECT_DELETE_CMU)
         dg.addUint32(doId)
-        self.sendToZoneExcept(obj.zoneId, dg, [])
+        self.sendToZoneExcept(obj.zoneId, dg, [client])  # the owner deleted it already
 
         self._unlinkObject(client, obj)
         del client.objectsByDoId[doId]
-        if doId == client.playerDoId:
-            self._releaseSlot(client)
         self.updateClientInterestZones(client)
 
     def _unlinkObject(self, client, obj):
@@ -625,8 +695,10 @@ class ArenaServerRepository(ServerRepository):
         dg = PyDatagram()
         dg.addUint16(OBJECT_DISABLE_CMU)
         dg.addUint32(obj.doId)
+        seenBy = self._seenBy(obj)
         for client in self.zonesToClients.get(oldZoneId, ()):
             if client is not owner and zoneId not in client.currentInterestZoneIds:
+                seenBy.discard(client)
                 self._send(client, dg)
 
     def _handleSetInterest(self, client, dgi):
@@ -643,112 +715,226 @@ class ArenaServerRepository(ServerRepository):
         self.updateClientInterestZones(client)
 
     def updateClientInterestZones(self, client):
-        before = set(client.currentInterestZoneIds)
-        ServerRepository.updateClientInterestZones(self, client)
-        added = client.currentInterestZoneIds - before
+        """The stock version, except that only the clients owning objects in a
+        newly heard zone (the AI) are asked to send them again, and nothing is
+        sent when no zone was dropped."""
+        before = client.currentInterestZoneIds
+        after = client.explicitInterestZoneIds | set(client.objectsByZoneId.keys())
+        if before == after:
+            return
+        client.currentInterestZoneIds = after
+        added, removed = after - before, before - after
+        for zoneId in added:
+            self.zonesToClients.setdefault(zoneId, set()).add(client)
+            dg = PyDatagram()
+            dg.addUint16(REQUEST_GENERATES_CMU)
+            dg.addUint32(zoneId)
+            for owner in list(self.clientsByConnection.values()):
+                if owner is not client and owner.objectsByZoneId.get(zoneId):
+                    self._send(owner, dg)
+        if removed:
+            dg = PyDatagram()
+            dg.addUint16(OBJECT_DISABLE_CMU)
+            for zoneId in removed:
+                self.zonesToClients.get(zoneId, set()).discard(client)
+                for obj in self.objectsByZoneId.get(zoneId, ()):
+                    dg.addUint32(obj.doId)
+                    self._seenBy(obj).discard(client)
+            self._send(client, dg)
+            client.knownSlots.clear()  # samples resume in full when it is back
         if added and client.accepted:
             self._sendZoneMovement(client, added)
 
     # ------------------------------------------------------------ movement
 
-    def _handleMove(self, client, dgi):
-        if dgi.getRemainingSize() != STATE_SIZE:
-            raise ProtocolError('bad move')
-        state = dgi.getRemainingBytes()
-        slot = client.slot
-        if slot is None:
-            return  # no player object (yet, or any more)
-        previous = self.pendingMoves.get(slot)
-        if previous is not None and previous[6] & FLAG_DASH:
-            # Several moves in one tick: relay the newest, keep its dash.
-            state = state[:6] + bytes((state[6] | FLAG_DASH,)) + state[7:]
-        self.pendingMoves[slot] = state
-        self.stats['moves'] += 1
+    def _handleInput(self, client, dgi):
+        """A player's input goes to the AI, and to nobody else."""
+        if dgi.getRemainingSize() != INPUT_SIZE:
+            raise ProtocolError('bad input')
+        if client.slot is None:
+            return  # no player (yet, or any more)
+        self.pendingInputs.append(bytes((client.slot,)) + dgi.getRemainingBytes())
+        self.stats['inputs'] += 1
 
-    def _emitMoves(self):
-        """One SERVER_MOVES per client per tick: the newest state of every
-        player in its zones that moved, except its own."""
-        if not self.pendingMoves:
+    def _emitInputs(self):
+        if not self.pendingInputs or self.aiClient is None:
+            self.pendingInputs = []
             return
-        pending, self.pendingMoves = self.pendingMoves, {}
+        pending, self.pendingInputs = self.pendingInputs, []
+        for first in range(0, len(pending), 255):
+            chunk = pending[first:first + 255]
+            dg = PyDatagram()
+            dg.addUint16(SERVER_INPUTS)
+            dg.appendData(bytes((len(chunk),)) + b''.join(chunk))
+            self._send(self.aiClient, dg)
+
+    def _playerObject(self, slot):
+        doId = self.slotDoIds.get(slot)
+        return self.aiClient.objectsByDoId.get(doId) if doId and self.aiClient else None
+
+    def _relayFrame(self, dgi):
+        """One batch from the AI (AI_FRAME): one SERVER_FRAME for each client
+        it concerns (frame.py), with the samples of everyone but the client's
+        own player, the events, and the client's SELF."""
+        data = dgi.getRemainingBytes()
+        try:
+            sent, samples, selfs, events = self._parseAiFrame(data)
+        except (IndexError, struct.error, FrameError):
+            self.notify.warning('malformed AI_FRAME')
+            return
+        # Each sample is coded once against its player's previous sample (for
+        # the clients that have it) and once in full (for the others).
         byZone = {}
-        for slot, state in pending.items():
-            owner = self.slotOwners.get(slot)
-            obj = owner.objectsByDoId.get(owner.playerDoId) if owner is not None else None
+        for slot, state in samples:
+            obj = self._playerObject(slot)
             if obj is None:
                 continue
-            self.lastStates[slot] = state[:6] + bytes((state[6] & ~FLAG_DASH,)) + state[7:]
-            byZone.setdefault(obj.zoneId, []).append((slot, state))
-        for zoneId, entries in byZone.items():
-            shared = None
-            slots = {slot for slot, _ in entries}
-            for client in self.zonesToClients.get(zoneId, ()):
-                if client.slot in slots:
-                    dg = self._movesDatagram([e for e in entries if e[0] != client.slot])
-                else:
-                    if shared is None:
-                        shared = self._movesDatagram(entries)
-                    dg = shared
-                if dg is not None:
-                    self._send(client, dg)
+            last = self.lastStates.get(slot)
+            full = BitWriter()
+            base = writeSample(full, slot, state, sent, None)
+            coded = None
+            if last is not None:
+                coded = BitWriter()
+                writeSample(coded, slot, state, sent, last[1])
+            self.lastStates[slot] = (sent, base)
+            byZone.setdefault(obj.zoneId, []).append((slot, coded, full))
+            self.stats['moves'] += 1
+        news = None
+        if events:
+            news = BitWriter()
+            for kind, fields in events:
+                news.put(1, 1)
+                writeEvent(news, kind, fields)
+            news.put(0, 1)
+
+        recipients = set(self.zonesToClients.get(ZONE_ARENA, ()))
+        for zoneId in byZone:
+            recipients.update(self.zonesToClients.get(zoneId, ()))
+        recipients.update(self.slotOwners[slot] for slot in selfs if slot in self.slotOwners)
+        recipients.discard(self.aiClient)
+        for client in recipients:
+            w = BitWriter()
+            writeHeader(w, sent, client.frameSent)
+            useful = False
+            for zoneId, entries in byZone.items():
+                if zoneId not in client.currentInterestZoneIds:
+                    continue
+                for slot, coded, full in entries:
+                    if slot == client.slot:
+                        continue  # its own player: SELF
+                    w.put(1, 1)
+                    if coded is not None and slot in client.knownSlots:
+                        w.extend(coded)
+                    else:
+                        w.extend(full)
+                        client.knownSlots.add(slot)
+                    useful = True
+            w.put(0, 1)
+            if news is not None and ZONE_ARENA in client.currentInterestZoneIds:
+                w.extend(news)
+                useful = True
+            else:
+                w.put(0, 1)
+            own = selfs.get(client.slot) if client.slot is not None else None
+            if own is not None and self.slotOwners.get(client.slot) is client:
+                w.put(1, 1)
+                writeSelf(w, own, sent)
+                useful = True
+            else:
+                w.put(0, 1)
+            if useful:
+                self._sendFrame(client, sent, w)
 
     @staticmethod
-    def _movesDatagram(entries):
-        if not entries:
-            return None
-        payload = bytearray((len(entries),))
-        for slot, state in entries:
-            payload.append(slot)
-            payload += state
+    def _parseAiFrame(data):
+        """(sent, [(slot, STATE fields)], {slot: SELF bytes}, [(kind, fields)])."""
+        sent = data[0] | data[1] << 8
+        offset = 3
+        samples = []
+        for _ in range(data[2]):
+            samples.append((data[offset], STATE.unpack_from(data, offset + 1)))
+            offset += MOVE_ENTRY_SIZE
+        count = data[offset]
+        offset += 1
+        selfs = {}
+        for _ in range(count):
+            selfs[data[offset]] = data[offset + 1:offset + SELF_ENTRY_SIZE]
+            offset += SELF_ENTRY_SIZE
+        events, offset = unpackAiEvents(data, offset + 1, data[offset])
+        if offset != len(data):
+            raise FrameError('AI_FRAME size')
+        return sent, samples, selfs, events
+
+    def _sendFrame(self, client, sent, writer):
+        client.frameSent = sent
         dg = PyDatagram()
-        dg.addUint16(SERVER_MOVES)
-        dg.appendData(bytes(payload))
-        return dg
+        dg.addUint16(SERVER_FRAME)
+        dg.appendData(writer.getvalue())
+        self._send(client, dg)
 
-    def _assignSlot(self, client, obj):
-        if client.slot is not None:
-            raise ProtocolError('already has a player object')
-        if not self.freeSlots:
-            raise ProtocolError('no free player slot')
-        slot = self.freeSlots.popleft()
-        client.slot = slot
-        client.playerDoId = obj.doId
-        self.slotOwners[slot] = client
-        self._sendSlots(self.zonesToClients.get(obj.zoneId, ()), [(slot, obj.doId)])
-
-    def _releaseSlot(self, client):
-        slot = client.slot
-        if slot is None:
+    def _bindSlot(self, dgi):
+        """AI_SLOT: the AI created (or removed) a player for a client."""
+        if dgi.getRemainingSize() != AI_SLOT_MSG.size:
+            self.notify.warning('malformed AI_SLOT')
             return
-        client.slot = client.playerDoId = None
-        self.slotOwners.pop(slot, None)
-        self.pendingMoves.pop(slot, None)
+        slot, clientId, doId = AI_SLOT_MSG.unpack(dgi.getRemainingBytes())
+        if slot == NO_SLOT:
+            return
+        old = self.slotOwners.pop(slot, None)
+        if old is not None and old.slot == slot:
+            old.slot = None
+        # A new player (or nobody) in this slot: its next sample goes in full.
         self.lastStates.pop(slot, None)
-        self.freeSlots.append(slot)
-        self._sendSlots([c for c in self.clientsByConnection.values() if c.accepted], [(slot, 0)])
+        for client in self.clientsByConnection.values():
+            client.knownSlots.discard(slot)
+        if doId == 0:
+            self.slotDoIds.pop(slot, None)
+            self._sendSlots([c for c in self.clientsByConnection.values()
+                             if c.accepted and c is not self.aiClient], [(slot, 0)])
+            return
+        client = self.clientsByDoIdBase.get(clientId)
+        self.slotDoIds[slot] = doId
+        if client is not None and client.accepted and client.role == ROLE_PLAYER:
+            client.slot = slot
+            self.slotOwners[slot] = client
+        # The AI creates players in the arena zone; whoever listens there
+        # learns the slot before the player's generate arrives.
+        self._sendSlots([c for c in self.zonesToClients.get(ZONE_ARENA, ()) if c is not self.aiClient],
+                        [(slot, doId)])
 
     def _sendSlots(self, recipients, pairs):
         dg = PyDatagram()
         dg.addUint16(SERVER_SLOTS)
-        dg.appendData(b''.join(_SLOT_ENTRY.pack(slot, doId) for slot, doId in pairs))
+        dg.appendData(b''.join(SLOT_ENTRY.pack(slot, doId) for slot, doId in pairs))
         for client in recipients:
             self._send(client, dg)
 
     def _sendZoneMovement(self, client, zoneIds):
-        """A client started listening to zones: tell it the slots and last
-        states of the players there before their generates arrive."""
-        pairs, states = [], []
-        for slot, owner in self.slotOwners.items():
-            obj = owner.objectsByDoId.get(owner.playerDoId)
+        """A client started listening to zones: tell it the slots and newest
+        samples of the players there before their generates arrive."""
+        if client is self.aiClient:
+            return
+        pairs, bySent = [], {}
+        for slot, doId in self.slotDoIds.items():
+            obj = self._playerObject(slot)
             if obj is None or obj.zoneId not in zoneIds:
                 continue
-            pairs.append((slot, owner.playerDoId))
-            if owner is not client and slot in self.lastStates:
-                states.append((slot, self.lastStates[slot]))
+            pairs.append((slot, doId))
+            if slot != client.slot and slot in self.lastStates:
+                sent, base = self.lastStates[slot]
+                bySent.setdefault(sent, []).append((slot, base))
         if pairs:
             self._sendSlots([client], pairs)
-        if states:
-            self._send(client, self._movesDatagram(states))
+        # In full, each with the step it was sent at (collisions go by it).
+        for sent, entries in bySent.items():
+            w = BitWriter()
+            writeHeader(w, sent, client.frameSent)
+            for slot, base in entries:
+                w.put(1, 1)
+                writeSample(w, slot, base[:8], sent, None)
+                client.knownSlots.add(slot)
+            w.put(0, 3)  # no more samples, no events, no SELF
+            self._sendFrame(client, sent, w)
 
     # ------------------------------------------------------------ sending
 
@@ -756,6 +942,7 @@ class ArenaServerRepository(ServerRepository):
         self.cw.send(datagram, client.connection)
         self.needsFlush.add(client)
         self.stats['msgsOut'] += 1
+        client.bytesOut += datagram.getLength() + 2
 
     def sendToZoneExcept(self, zoneId, datagram, exceptionList):
         for client in self.zonesToClients.get(zoneId, ()):

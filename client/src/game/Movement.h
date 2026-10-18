@@ -1,8 +1,11 @@
-// Local player physics: acceleration-based movement, dash, knockback and
+// Player physics: acceleration-based movement, dash, knockback and
 // collisions against the arena edge and pillars. Pure functions, no Panda
-// scene graph, so they are unit-tested (tests/MovementTests.cpp).
+// scene graph, so they are unit-tested (tests/MovementTests.cpp). The AI
+// runs a line-by-line Python twin (server/arena/motion.py) for every player;
+// this client runs it to predict its own player from the same inputs.
 #pragma once
 
+#include <cstdint>
 #include <vector>
 
 namespace arena::game {
@@ -53,11 +56,15 @@ struct MoveState {
 // The fixed physics step (GameClient runs stepMovement() at 120 Hz).
 inline constexpr double kPhysicsStep = 1.0 / 120.0;
 
+// Timers (dashLeft, dashCooldown, stun) count as run out within this (s).
+inline constexpr float kTimerEps = 1e-3f;
+
 // Advances the state by dt. Returns true if a dash started.
 bool stepMovement(MoveState &s, const MoveInput &in, const Rules &rules, const ArenaLayout &arena, float dt);
 
-// Server-sent knockback: velocity replaced, control reduced for a moment.
-void applyKnockback(MoveState &s, float vx, float vy, float stunTime = 0.35f);
+// A hit's knockback: velocity replaced, control reduced for a moment.
+inline constexpr float kStunTime = 0.35f;
+void applyKnockback(MoveState &s, float vx, float vy, float stunTime = kStunTime);
 
 // Keeps the player inside the arena and out of pillars; bounces velocity.
 void resolveCollisions(MoveState &s, const Rules &rules, const ArenaLayout &arena);
@@ -80,6 +87,13 @@ struct MotionSample {
     float x = 0.0f, y = 0.0f, vx = 0.0f, vy = 0.0f;
     float ix = 0.0f, iy = 0.0f;  // held input: unit length, or zero
     float hold = 0.0f;           // s the velocity is held first
+};
+
+// A sample and the step the AI sent it at: which samples our player bumps
+// into at a given step (Prediction, SelfState::knowDelay).
+struct KnownSample {
+    MotionSample s;        // s.t on the network clock
+    int64_t sentStep = 0;
 };
 
 struct MotionPose {

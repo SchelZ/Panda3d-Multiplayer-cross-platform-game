@@ -315,7 +315,7 @@ ARENA_TEST(remote_motion_snaps_only_on_teleports_and_stops_predicting) {
 ARENA_TEST(view_delay_follows_lateness_slowly) {
     ViewDelay d;
     for (int i = 0; i < 40; ++i) d.addLateness(0.08);
-    for (int i = 0; i < 8; ++i) d.addLateness(0.4);  // 1 in 6 very late: covered, up to kMax
+    for (int i = 0; i < 8; ++i) d.addLateness(0.7);  // 1 in 6 very late: covered, up to kMax
     CHECK_NEAR(d.target(), ViewDelay::kMax, 1e-6);
     for (int i = 0; i < 44; ++i) d.addLateness(0.08);  // 1 in 12: an outlier, ignored
     CHECK_NEAR(d.target(), 0.09, 1e-6);
@@ -324,7 +324,7 @@ ARENA_TEST(view_delay_follows_lateness_slowly) {
     CHECK_NEAR(d.value(), before + 0.5 * ViewDelay::kRate, 1e-9);  // never faster than kRate
     for (int i = 0; i < 100; ++i) d.update(0.1);
     CHECK_NEAR(d.value(), 0.09, 1e-6);
-    CHECK(d.wire() == 22);  // 4 ms units
+    CHECK(d.wire() == 11);  // 8 ms units
     for (int i = 0; i < 100; ++i) d.addLateness(0.0);
     CHECK_NEAR(d.target(), ViewDelay::kMin, 1e-9);
 }
@@ -343,33 +343,51 @@ ARENA_TEST(turn_toward_spins_a_reversal_smoothly) {
 }
 
 ARENA_TEST(protocol_wire_state_matches_python) {
-    // Bytes from server/arena/protocol.py packState() with the same arguments.
+    // Bytes from server/arena/protocol.py packState() with the same arguments
+    // (step and sent step there, their difference here; 255 at most).
     struct Case {
         float x, y, vx, vy;
         uint8_t flags;
-        uint16_t t;
-        float ix, iy;
+        uint8_t age;
+        float ix, iy, heading;
         const char *hex;
     };
     const Case cases[] = {
-        {1.234f, -5.0f, 8.9f, -24.1f, 1, 40000, 0, 0, "7b000cfe24a00100409c"},
-        {-327.68f, 327.67f, -32.0f, 31.75f, 0, 65535, 0, 0, "0080ff7f807f0000ffff"},
-        {0.005f, -0.005f, 0.125f, -0.125f, 0, 0, 0, 0, "00000000000000000000"},  // halves to even
-        {999.0f, -999.0f, 99.0f, -99.0f, 1, 1, 0, 0, "ff7f00807f8001000100"},    // clamped
-        {2.5f, 1.0f, 9.0f, 0.0f, 1 | 30 << 2, 1234, 0.6f, -0.8f, "fa00640024007bdad204"},  // input
-        {0.0f, 0.0f, 0.0f, 0.0f, 63 << 2, 7, -1.0f, 0.0f, "000000000000fe800700"},
+        {1.234f, -5.0f, 8.9f, -24.1f, 1, 10, 0, 0, 0.0f, "7b000cfe24a00100000a"},
+        {-327.68f, 327.67f, -32.0f, 31.75f, 0, 255, 0, 0, 179.0f, "0080ff7f807f00007fff"},
+        {0.005f, -0.005f, 0.125f, -0.125f, 0, 0, 0, 0, -90.0f, "0000000000000000c000"},  // halves to even
+        {999.0f, -999.0f, 99.0f, -99.0f, 1 | 4, 255, 0, 0, 45.0f, "ff7f00807f80050020ff"},  // clamped
+        {2.5f, 1.0f, 9.0f, 0.0f, 1, 6, 0.6f, -0.8f, -135.0f, "fa006400240003daa006"},     // input
+        {0.0f, 0.0f, 0.0f, 0.0f, 0, 3, -1.0f, 0.0f, 180.0f, "00000000000002808003"},
     };
     for (const Case &c : cases) {
         uint8_t b[WireState::kSize];
-        const WireState w = WireState::make(c.x, c.y, c.vx, c.vy, c.flags, c.t, c.ix, c.iy);
+        const WireState w = WireState::make(c.x, c.y, c.vx, c.vy, c.flags, c.age, c.ix, c.iy, c.heading);
         w.encode(b);
         char hex[2 * WireState::kSize + 1];
         for (size_t i = 0; i < WireState::kSize; ++i) std::snprintf(hex + 2 * i, 3, "%02x", b[i]);
         CHECK(std::string(hex) == c.hex);
         const WireState d = WireState::decode(b);
         CHECK(d.x == w.x && d.y == w.y && d.vx == w.vx && d.vy == w.vy && d.flags == w.flags &&
-              d.dir == w.dir && d.t == w.t);
+              d.dir == w.dir && d.heading == w.heading && d.age == w.age);
         CHECK_NEAR(d.inputX(), c.ix, 0.02);
         CHECK_NEAR(d.inputY(), c.iy, 0.02);
+        CHECK_NEAR(std::remainder(d.headingDeg() - c.heading, 360.0f), 0.0, 0.8);
     }
+}
+
+ARENA_TEST(protocol_input_matches_python) {
+    using arena::net::InputCmd;
+    // protocol.packInput(300, 70000, INPUT_DASH | INPUT_HELD | 30 << 2, 200, 9)
+    const InputCmd in{static_cast<uint8_t>(300 & 0xff), static_cast<uint16_t>(70000 & 0xffff), 1 | 2 | 30 << 2, 200,
+                      9};
+    uint8_t b[InputCmd::kSize];
+    in.encode(b);
+    char hex[2 * InputCmd::kSize + 1];
+    for (size_t i = 0; i < InputCmd::kSize; ++i) std::snprintf(hex + 2 * i, 3, "%02x", b[i]);
+    CHECK(std::string(hex) == "2c70117bc809");
+    const InputCmd back = InputCmd::decode(b);
+    CHECK(back.seq == in.seq && back.step == in.step && back.flags == in.flags && back.dir == in.dir &&
+          back.sampleDelay == in.sampleDelay);
+    // SELF arrives in a SERVER_FRAME: FrameTests.cpp.
 }

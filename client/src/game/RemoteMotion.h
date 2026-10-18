@@ -74,13 +74,13 @@ private:
 // How far in the past remote players are drawn: about the 90th percentile of
 // how late their samples arrive, so most turns and stops are known before
 // they are drawn. It changes slowly (kRate), which is invisible, and goes out
-// in every movement sample (4 ms units) so the AI can replay what we saw.
+// with our inputs (8 ms units) so the AI can replay what we saw.
 class ViewDelay {
 public:
-    static constexpr double kMin = 0.02, kMax = 0.25;  // s
+    static constexpr double kMin = 0.02, kMax = 0.5;   // s
     static constexpr double kMargin = 0.01;           // s above the percentile
     static constexpr double kRate = 0.05;             // s of change per second
-    static constexpr double kUnit = 0.004;            // s per wire unit
+    static constexpr double kUnit = 0.008;            // s per wire unit
     static constexpr int kWindow = 48;                // lateness samples kept
 
     void addLateness(double lateness);

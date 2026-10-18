@@ -3,9 +3,10 @@
 
     python tests/trace_stats.py trace0.csv trace1.csv ...
 
-Every client logs, on the shared network clock, where it really is (L lines)
-and where it draws every other player (R lines). For each R line this looks up
-where that player really was at the same moment (its own L trace) and reports:
+Every client logs, on the shared network clock, where its player really was
+(L lines: the AI's simulation), where it shows its own player (S lines) and
+where it draws every other player (R lines). For each R line this looks up
+where that player really was at the same moment (its L trace) and reports:
 
 * error:  distance between drawn and true position (cm);
 * jerk:   how hard the drawn motion accelerates from frame to frame, against
@@ -19,6 +20,9 @@ where that player really was at the same moment (its own L trace) and reports:
           more than 90 degrees off: the rubber band of an overshoot pulled back;
 * turn snaps: frames where a drawn heading turned more than 20 degrees at
           once (1200 degrees/s at 60 fps).
+
+The same jumps and turn snaps are reported for each client's own player on
+its own screen (S lines): a correction of its prediction shows there.
 """
 
 import bisect
@@ -36,6 +40,7 @@ TURN_SNAP = 20.0        # degrees of heading change in one frame
 def load(paths):
     truth = defaultdict(list)    # doId -> [(t, x, y, h)]
     drawn = defaultdict(list)    # (file, doId) -> [(t, x, y, h)]
+    shown = defaultdict(list)    # doId -> [(t, x, y, h)], own player on its screen
     for path in paths:
         with open(path) as f:
             for line in f:
@@ -48,9 +53,11 @@ def load(paths):
                     truth[doId].append((t, x, y, h))
                 elif kind == 'R':
                     drawn[(path, doId)].append((t, x, y, h))
+                elif kind == 'S':
+                    shown[doId].append((t, x, y, h))
     for track in truth.values():
         track.sort()
-    return truth, drawn
+    return truth, drawn, shown
 
 
 def truthAt(track, times, t):
@@ -113,15 +120,41 @@ def pct(values, p):
     return values[min(len(values) - 1, int(p / 100.0 * len(values)))]
 
 
+def countJumps(points, track, times):
+    """(jumps, backtracks) of a drawn track against the real one."""
+    jumps = backtracks = 0
+    for a, b in zip(points, points[1:]):
+        dt = b[0] - a[0]
+        if not 1e-4 < dt <= MAX_GAP:
+            continue
+        dx, dy = b[1] - a[1], b[2] - a[2]
+        speed = math.hypot(dx, dy) / dt
+        window = (b[0] - JUMP_WINDOW[0], b[0] + JUMP_WINDOW[1])
+        if window[0] < times[0] or window[1] > times[-1]:
+            continue  # the real track does not cover this frame
+        if speed > JUMP_MARGIN:
+            real = maxTrueSpeed(track, times, *window)
+            if speed > JUMP_FACTOR * real + JUMP_MARGIN:
+                jumps += 1
+        if speed > BACKTRACK_SPEED and not wentThatWay(track, times, window[0], window[1], dx, dy):
+            backtracks += 1
+    return jumps, backtracks
+
+
 def analyse(paths):
-    truth, drawn = load(paths)
+    truth, drawn, shown = load(paths)
     times = {doId: [p[0] for p in track] for doId, track in truth.items()}
     errors, drawnAcc, jumps, backtracks, snaps, seconds = [], [], 0, 0, 0, 0.0
-    trueAcc, trueSnaps, trueSeconds = [], 0, 0.0
+    trueAcc, ownSnaps, ownJumps, ownSeconds = [], 0, 0, 0.0
     for track in truth.values():
         trueAcc += accelerations(track)
-        trueSnaps += turnSnaps(track)
-        trueSeconds += track[-1][0] - track[0][0] if track else 0.0
+    for doId, points in shown.items():
+        track = truth.get(doId)
+        if not track or len(points) < 3:
+            continue
+        ownSnaps += turnSnaps(points)
+        ownJumps += countJumps(points, track, times[doId])[0]
+        ownSeconds += points[-1][0] - points[0][0]
     for (path, doId), points in drawn.items():
         track = truth.get(doId)
         if not track or len(points) < 3:
@@ -133,19 +166,9 @@ def analyse(paths):
                 errors.append(math.hypot(x - real[0], y - real[1]))
         drawnAcc += accelerations(points)
         snaps += turnSnaps(points)
-        for a, b in zip(points, points[1:]):
-            dt = b[0] - a[0]
-            if not 1e-4 < dt <= MAX_GAP:
-                continue
-            dx, dy = b[1] - a[1], b[2] - a[2]
-            speed = math.hypot(dx, dy) / dt
-            window = (b[0] - JUMP_WINDOW[0], b[0] + JUMP_WINDOW[1])
-            if speed > JUMP_MARGIN:
-                real = maxTrueSpeed(track, times[doId], *window)
-                if speed > JUMP_FACTOR * real + JUMP_MARGIN:
-                    jumps += 1
-            if speed > BACKTRACK_SPEED and not wentThatWay(track, times[doId], window[0], window[1], dx, dy):
-                backtracks += 1
+        j, b = countJumps(points, track, times[doId])
+        jumps += j
+        backtracks += b
     return {
         'samples': len(errors),
         'error_mean_cm': 100.0 * sum(errors) / len(errors) if errors else float('nan'),
@@ -160,18 +183,21 @@ def analyse(paths):
         'jumps_per_min': 60.0 * jumps / seconds if seconds else float('nan'),
         'backtracks_per_min': 60.0 * backtracks / seconds if seconds else float('nan'),
         'turn_snaps_per_min': 60.0 * snaps / seconds if seconds else float('nan'),
-        'own_turn_snaps_per_min': 60.0 * trueSnaps / trueSeconds if trueSeconds else float('nan'),
+        'own_turn_snaps_per_min': 60.0 * ownSnaps / ownSeconds if ownSeconds else float('nan'),
+        'own_jumps_per_min': 60.0 * ownJumps / ownSeconds if ownSeconds else float('nan'),
     }
 
 
 def describe(s):
     return ('drawn vs true position: mean %.1f cm, median %.1f cm, p95 %.1f cm; '
             'acceleration drawn p50/p90/p99 %.0f/%.0f/%.0f m/s2 (true %.0f/%.0f/%.0f); '
-            'per player-minute: jumps %.2f, backtracks %.1f, turn snaps %.1f (own player %.1f)'
+            'per player-minute: jumps %.2f, backtracks %.1f, turn snaps %.1f; own player on its '
+            'screen: jumps %.2f, turn snaps %.1f'
             % (s['error_mean_cm'], s['error_p50_cm'], s['error_p95_cm'],
                s['drawn_acc_p50'], s['drawn_acc_p90'], s['drawn_acc_p99'],
                s['true_acc_p50'], s['true_acc_p90'], s['true_acc_p99'], s['jumps_per_min'],
-               s['backtracks_per_min'], s['turn_snaps_per_min'], s['own_turn_snaps_per_min']))
+               s['backtracks_per_min'], s['turn_snaps_per_min'], s['own_jumps_per_min'],
+               s['own_turn_snaps_per_min']))
 
 
 if __name__ == '__main__':

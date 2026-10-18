@@ -3,6 +3,7 @@
 
 #include "game/Movement.h"
 #include "net/DistributedObject.h"
+#include "net/Frame.h"
 
 #include <array>
 #include <cstdint>
@@ -41,7 +42,12 @@ public:
     void announceGenerate() override;
     void disable() override;
 
+    // An orb spawned or collected, a dash hit: events that come in
+    // SERVER_FRAME with the movement, not as fields.
+    void applyEvent(const net::FrameEvent &e);
+
     // Requests to the AI.
+    void requestJoin(const std::string &name, int colorIndex);
     void requestChat(const std::string &text);
     void ping(uint16_t context);
 
@@ -59,14 +65,10 @@ private:
     void setRound(net::FieldReader &in);
     void setOrbs(net::FieldReader &in);
     void setScores(net::FieldReader &in);
-    void orbSpawned(net::FieldReader &in);
-    void orbCollected(net::FieldReader &in);
-    void playerHit(net::FieldReader &in);
     void chatMessage(net::FieldReader &in);
     void notice(net::FieldReader &in);
+    void joined(net::FieldReader &in);
     void pong(net::FieldReader &in);
-    void knockback(net::FieldReader &in);
-    void correctPosition(net::FieldReader &in);
 
     GameEvents &events_;
     Rules rules_;

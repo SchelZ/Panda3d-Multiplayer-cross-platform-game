@@ -13,8 +13,8 @@ from panda3d.direct import CConnectionRepository
 
 from .DistributedArenaGameAI import DistributedArenaGameAI
 from .protocol import (
-    CLIENT_HELLO_ARENA, MOVE_ENTRY_SIZE, PROTOCOL_VERSION, ROLE_AI, SERVER_MOVES,
-    SERVER_REJECT_ARENA, SERVER_SLOTS, ZONE_ARENA, ZONE_GLOBAL, unpackState)
+    AI_FRAME, AI_SLOT, AI_SLOT_MSG, CLIENT_HELLO_ARENA, INPUT_ENTRY_SIZE, PROTOCOL_VERSION, ROLE_AI, SERVER_CLIENT_LEFT, SERVER_INPUTS, SERVER_REJECT_ARENA, ZONE_ARENA,
+    ZONE_GLOBAL, unpackInput, wrapStep)
 
 
 class ArenaTimeManagerAI(TimeManagerAI):
@@ -30,7 +30,7 @@ class ArenaTimeManagerAI(TimeManagerAI):
 class ArenaAIRepository(ClientRepository):
     notify = DirectNotifyGlobal.directNotify.newCategory('ArenaAIRepository')
 
-    def __init__(self, port, token, dcFileNames, rules, onReady=None, onLost=None):
+    def __init__(self, port, token, dcFileNames, rules, onReady=None, onLost=None, batchRate=None):
         ClientRepository.__init__(self, dcFileNames=dcFileNames, dcSuffix='AI',
                                   connectMethod=ClientRepository.CM_NET,
                                   threadedNet=False)
@@ -38,12 +38,11 @@ class ArenaAIRepository(ClientRepository):
         self.dclassesByName['ArenaTimeManagerAI'] = self.dclassesByName['TimeManagerAI']
         self.token = token
         self.rules = rules
+        self.batchRate = batchRate
         self.onReady = onReady
         self.onLost = onLost
         self.game = None
         self.timeManager = None
-        self.slotToDoId = {}      # movement slots (SERVER_SLOTS)
-        self.doIdToSlot = {}
         self.accept(self.uniqueName('createReady'), self._createReady)
         self.connect([URLSpec('tcp://127.0.0.1:%d' % port)],
                      successCallback=self._connected,
@@ -70,7 +69,8 @@ class ArenaAIRepository(ClientRepository):
             className='TimeManagerAI', distObj=ArenaTimeManagerAI(self), zoneId=ZONE_GLOBAL)
         self.game = self.createDistributedObject(
             className='DistributedArenaGameAI',
-            distObj=DistributedArenaGameAI(self, self.rules), zoneId=ZONE_ARENA)
+            distObj=DistributedArenaGameAI(self, self.rules, batchRate=self.batchRate),
+            zoneId=ZONE_ARENA)
         # Listen to the arena so player objects and their updates reach us.
         self.setInterestZones([ZONE_GLOBAL, ZONE_ARENA])
         self.notify.info('AI ready: TimeManager %d, game %d'
@@ -104,10 +104,12 @@ class ArenaAIRepository(ClientRepository):
             self.notify.warning('error handling message:\n' + traceback.format_exc())
 
     def handleMessageType(self, msgType, di):
-        if msgType == SERVER_MOVES:
-            self._handleMoves(di)
-        elif msgType == SERVER_SLOTS:
-            self._handleSlots(di)
+        if msgType == SERVER_INPUTS:
+            self._handleInputs(di)
+        elif msgType == SERVER_CLIENT_LEFT:
+            clientId = di.getUint32()
+            if self.game is not None:
+                self.game.onClientLeft(clientId)
         elif msgType == SERVER_REJECT_ARENA:
             code = di.getUint16()
             reason = di.getString()
@@ -115,28 +117,54 @@ class ArenaAIRepository(ClientRepository):
         else:
             self.notify.warning('unexpected message type %d' % msgType)
 
-    def _handleSlots(self, di):
-        while di.getRemainingSize() >= 5:
-            slot = di.getUint8()
-            doId = di.getUint32()
-            old = self.slotToDoId.pop(slot, None)
-            if old is not None and self.doIdToSlot.get(old) == slot:
-                del self.doIdToSlot[old]
-            if doId:
-                self.slotToDoId[slot] = doId
-                self.doIdToSlot[doId] = slot
-
-    def _handleMoves(self, di):
+    def _handleInputs(self, di):
+        """Players' inputs as they arrived this tick (protocol.py)."""
         data = di.getRemainingBytes()
-        if not data or len(data) != 1 + data[0] * MOVE_ENTRY_SIZE or self.game is None:
+        game = self.game
+        if not data or len(data) != 1 + data[0] * INPUT_ENTRY_SIZE or game is None:
             return
-        for offset in range(1, len(data), MOVE_ENTRY_SIZE):
-            player = self.doId2do.get(self.slotToDoId.get(data[offset]))
-            if player is not None and getattr(player, 'registered', False):
-                self.game.onPlayerState(player, *unpackState(data, offset + 1))
+        now = game.now()
+        nowStep = game.nowStep(now)
+        bySlot = {p.slot: p for p in game.players.values()}
+        for offset in range(1, len(data), INPUT_ENTRY_SIZE):
+            player = bySlot.get(data[offset])
+            if player is not None:
+                player.sim.onInput(*unpackInput(data, offset + 1), nowStep=nowStep, now=now)
 
-    def slotOf(self, doId):
-        return self.doIdToSlot.get(doId)
+    # --------------------------------------------------- AI -> server
+
+    def sendSlot(self, slot, clientId, doId):
+        """Binds a slot to a player's client and object (doId 0 frees it)."""
+        dg = PyDatagram()
+        dg.addUint16(AI_SLOT)
+        dg.appendData(AI_SLOT_MSG.pack(slot, clientId, doId))
+        self.send(dg)
+
+    def sendFrame(self, step, samples, selfs, events):
+        """One batch, sent at `step` (protocol.py AI_FRAME): [(slot, STATE
+        bytes)] for everyone in the arena, [(slot, SELF bytes)] for the
+        players' own clients, [event bytes] (frame.packAiEvent) for everyone."""
+        first = True
+        while first or samples or selfs or events:
+            first = False
+            parts = [wrapStep(step).to_bytes(2, 'little')]
+            for items in (samples, selfs):
+                parts.append(bytes((min(len(items), 255),)))
+                parts.extend(bytes((slot,)) + data for slot, data in items[:255])
+            parts.append(bytes((min(len(events), 255),)))
+            parts.extend(events[:255])
+            samples, selfs, events = samples[255:], selfs[255:], events[255:]
+            dg = PyDatagram()
+            dg.addUint16(AI_FRAME)
+            dg.appendData(b''.join(parts))
+            self.send(dg)
+
+    def deletePlayer(self, player):
+        """Removes a player object we created, here and everywhere."""
+        doId = player.doId
+        if doId in self.doId2do:
+            self.sendDeleteMsg(doId)
+            self.deleteObject(doId)
 
     def lostConnection(self):
         self.notify.warning('AI lost its connection to the server')

@@ -43,8 +43,9 @@ class DistributedArenaGame(DistributedObject):
     def setScores(self, scores):
         self.scores = {s[0]: s[1] for s in scores}
 
-    def orbSpawned(self, orb):
-        self.orbs[orb[0]] = (orb[1], orb[2], orb[3])
+    # Events from SERVER_FRAME (frame.py), not DC fields.
+    def orbSpawned(self, orbId, x, y, kind):
+        self.orbs[orbId] = (x, y, kind)
 
     # Players are named by slot (protocol.py); scores are kept by slot too.
     def orbCollected(self, orbId, slot, score):
@@ -64,14 +65,11 @@ class DistributedArenaGame(DistributedObject):
         self._event('notice', kind, slot, value)
 
     # Targeted replies from the AI.
+    def joined(self, slot, playerId):
+        self.cr.onJoined(slot, playerId)
+
     def pong(self, context):
         self.cr.onPong(context)
-
-    def knockback(self, vx, vy):
-        self.cr.onKnockback(vx, vy)
-
-    def correctPosition(self, x, y):
-        self.cr.onCorrectPosition(x, y)
 
     def announceGenerate(self):
         DistributedObject.announceGenerate(self)

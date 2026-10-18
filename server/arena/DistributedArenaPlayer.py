@@ -1,7 +1,7 @@
 """Client view of a player, used by the Python bots (arena/bots.py).
 The C++ client has its own implementation (client/src/game/ArenaPlayer.cpp).
-Positions arrive as binary SERVER_MOVES messages, which the bot repository
-applies to these objects by slot."""
+The AI creates every player; positions arrive in binary SERVER_FRAME
+messages, which the bot repository applies to these objects by slot."""
 
 from direct.distributed.DistributedObject import DistributedObject
 
@@ -34,8 +34,7 @@ class DistributedArenaPlayer(DistributedObject):
 
     def announceGenerate(self):
         DistributedObject.announceGenerate(self)
-        if not self.cr.isLocalId(self.doId):
-            self.cr.remotePlayers[self.doId] = self
+        self.cr.remotePlayers[self.doId] = self
 
     def disable(self):
         self.cr.remotePlayers.pop(self.doId, None)

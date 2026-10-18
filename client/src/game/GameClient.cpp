@@ -26,6 +26,7 @@ const char *phaseName(GameClient::Phase p) {
     case GameClient::Phase::Connecting: return "connecting";
     case GameClient::Phase::SyncingTime: return "syncing time";
     case GameClient::Phase::EnteringArena: return "entering arena";
+    case GameClient::Phase::Joining: return "joining";
     case GameClient::Phase::Playing: return "playing";
     case GameClient::Phase::Rejected: return "rejected";
     }
@@ -111,7 +112,11 @@ bool GameClient::init(std::string &error) {
 
     cr_.onReady = [this] { onRepositoryReady(); };
     cr_.onSlot = [this](uint8_t slot, uint32_t doId) { onSlot(slot, doId); };
-    cr_.onMove = [this](uint8_t slot, const net::WireState &state) { onMove(slot, state); };
+    cr_.onMove = [this](uint8_t slot, const net::WireState &state, uint16_t sent) { onMove(slot, state, sent); };
+    cr_.onEvent = [this](const net::FrameEvent &e) {
+        if (game_ != nullptr) game_->applyEvent(e);
+    };
+    cr_.onSelf = [this](const net::SelfState &msg) { onSelf(msg); };
     cr_.onConnectFailed = [this](const std::string &why) { scheduleReconnect(nextBackoff(), why); };
     cr_.onLost = [this] {
         if (hud_) hud_->addSystem("Connection lost", now_);
@@ -140,17 +145,28 @@ bool GameClient::init(std::string &error) {
 
 void GameClient::start() { connectNow(); }
 
-// One line per player per frame, on the shared network clock:
-//   L,<doId>,<t>,<x>,<y>,<h>   where this client really is (h: drawn heading)
-//   R,<doId>,<t>,<x>,<y>,<h>   where it draws another player
-// server/tests/trace_stats.py compares every R line with the owner's L trace.
+// On the shared network clock:
+//   L,<doId>,<t>,<x>,<y>,<h>   where our player really was: the AI's simulation,
+//                              which our history matches half a second later
+//                              (any correction has arrived by then), every step
+//   S,<doId>,<t>,<x>,<y>,<h>   where we show our player, every frame
+//   R,<doId>,<t>,<x>,<y>,<h>   where we draw another player, every frame
+// server/tests/trace_stats.py compares every R and S line with the L trace.
 void GameClient::writeTrace(double now) {
     if (phase_ != Phase::Playing || local_ == nullptr || !cr_.clockDelta().synced()) return;
     const double t = now - cr_.clockDelta().delta();
-    std::fprintf(trace_, "L,%u,%.4f,%.3f,%.3f,%.1f\n", local_->doId(), t, move_.x, move_.y, local_->h());
+    const int64_t settled = prediction_.step() - static_cast<int64_t>(net::kStepsPerSec / 2);
+    for (int64_t k = std::max(tracedStep_ + 1, settled - 4); k <= settled; ++k) {
+        if (const MoveState *s = prediction_.predictedAt(k)) {
+            std::fprintf(trace_, "L,%u,%.4f,%.3f,%.3f,%.1f\n", local_->doId(), k / net::kStepsPerSec, s->x, s->y,
+                         s->heading);
+        }
+    }
+    tracedStep_ = std::max(tracedStep_, settled);
+    std::fprintf(trace_, "S,%u,%.4f,%.3f,%.3f,%.1f\n", local_->doId(), t, local_->x(), local_->y(), local_->h());
     for (const auto &kv : players_) {
         const ArenaPlayer *p = kv.second;
-        if (!p->isLocal()) std::fprintf(trace_, "R,%u,%.4f,%.3f,%.3f,%.1f\n", kv.first, t, p->x(), p->y(), p->h());
+        if (p != local_) std::fprintf(trace_, "R,%u,%.4f,%.3f,%.3f,%.1f\n", kv.first, t, p->x(), p->y(), p->h());
     }
 }
 
@@ -170,7 +186,9 @@ void GameClient::settleDashes(double now, bool all) {
 void GameClient::shutdown() {
     settleDashes(now_, true);
     if (cr_.state() != net::ClientRepository::State::Idle) {
+        closing_ = true;
         cr_.disconnect();  // tells the server, so others see us leave at once
+        closing_ = false;
     }
 }
 
@@ -193,6 +211,10 @@ void GameClient::resetSlots() {
     for (Slot &s : slots_) s = Slot{};
     localSlot_ = net::kNoSlot;
     lastHitAt_.fill(-1e9);
+    myDoId_ = 0;
+    prediction_ = Prediction{};
+    dashLatch_ = false;
+    smoothX_ = smoothY_ = 0.0f;
 }
 
 void GameClient::connectNow() {
@@ -249,45 +271,26 @@ void GameClient::enterArena() {
     cr_.setInterestZones({net::kZoneGlobal, net::kZoneArena});
 }
 
-void GameClient::createLocalPlayer() {
-    if (local_ != nullptr || game_ == nullptr) {
+// The AI creates our player where it decides (and tells everyone which way
+// it faces); we only ask, with the name and color we would like.
+void GameClient::requestJoin() {
+    if (game_ == nullptr || phase_ == Phase::Joining || phase_ == Phase::Playing) {
         return;
     }
-    const Rules &r = game_->rules();
-    const ArenaLayout &arena = game_->layout();
-    // Spawn somewhere free: away from pillars and other players.
-    std::uniform_real_distribution<float> angle(0.0f, 6.2831853f), unit(0.0f, 1.0f);
-    float sx = 0.0f, sy = 0.0f;
-    for (int attempt = 0; attempt < 64; ++attempt) {
-        const float a = angle(rng_);
-        const float d = (arena.radius - 3.0f) * std::sqrt(unit(rng_));
-        sx = d * std::cos(a);
-        sy = d * std::sin(a);
-        bool ok = true;
-        for (const Pillar &p : arena.pillars) {
-            ok = ok && std::hypot(sx - p.x, sy - p.y) > p.radius + r.playerRadius + 1.0f;
-        }
-        for (const auto &kv : players_) {
-            ok = ok && std::hypot(sx - kv.second->x(), sy - kv.second->y()) > 4.0f * r.playerRadius;
-        }
-        if (ok) break;
-    }
-    move_ = MoveState{};
-    move_.x = sx;
-    move_.y = sy;
-    move_.heading = std::atan2(sx, -sy) * 57.29578f;  // face the centre
-    prevMove_ = move_;
-    shownHeading_ = move_.heading;
-    accumulator_ = 0.0;
+    game_->requestJoin(options_.name, options_.color);
+    setPhase(Phase::Joining);
+}
 
-    auto player = std::make_unique<ArenaPlayer>(cr_, *this);
-    player->setIdentity(options_.name, options_.color);
-    player->setLocalPose(move_.x, move_.y, move_.heading, 0.0f, 0.0f);
-    local_ = static_cast<ArenaPlayer *>(cr_.createLocal(std::move(player), "DistributedArenaPlayer", net::kZoneArena));
-    if (local_ == nullptr) {
-        LOG_ERROR("could not create the player object");
+// Playing once we know which player is ours and where the AI put it.
+void GameClient::startPlaying() {
+    if (phase_ != Phase::Joining || local_ == nullptr || !prediction_.started()) {
         return;
     }
+    const MoveState &s = prediction_.state();
+    shownHeading_ = s.heading;
+    sampleDelays_.fill(0);  // this connection's
+    sampleDelayNext_ = 0;
+    local_->setLocalPose(s.x, s.y, s.heading);
     setPhase(Phase::Playing);
     playingSince_ = now_;
     counters_.everPlayed = true;
@@ -319,6 +322,12 @@ void GameClient::update(double now, double dt, const PlayerInput &input) {
             scheduleReconnect(nextBackoff(), "the server has no arena");
         }
         break;
+    case Phase::Joining:
+        if (now - phaseSince_ > 10.0) {
+            cr_.disconnect();
+            scheduleReconnect(nextBackoff(), "the server did not let us join");
+        }
+        break;
     default:
         break;
     }
@@ -348,7 +357,7 @@ void GameClient::update(double now, double dt, const PlayerInput &input) {
     int others = 0;
     for (auto &kv : players_) {
         ArenaPlayer *p = kv.second;
-        if (p->isLocal()) continue;
+        if (p == local_) continue;
         ++others;
         p->updateSmoothing(now, static_cast<float>(dt), viewDelay_.value(), rules());
         if (world_) world_->setPlayerPose(p->doId(), p->x(), p->y(), p->h());
@@ -372,6 +381,17 @@ void GameClient::update(double now, double dt, const PlayerInput &input) {
     }
 }
 
+// In slot order, as the AI pushes off them.
+Prediction::Others GameClient::otherPositions() const {
+    Prediction::Others out;
+    out.reserve(players_.size());
+    for (const Slot &s : slots_) {
+        const ArenaPlayer *p = s.player;
+        if (p != nullptr && p != local_ && p->knownCount() > 0) out.push_back({p->known().data(), p->knownCount()});
+    }
+    return out;
+}
+
 void GameClient::simulate(double now, double dt, PlayerInput input) {
     const Rules &rules = game_->rules();
     const ArenaLayout &arena = game_->layout();
@@ -379,37 +399,41 @@ void GameClient::simulate(double now, double dt, PlayerInput input) {
         input = botInput(now);
     }
 
-    constexpr double kStep = kPhysicsStep;
-    accumulator_ = std::min(accumulator_ + dt, 0.25);  // never spiral after a hitch
-    // The input as stepMovement() uses it, for the others' prediction.
-    float heldX = input.x, heldY = input.y;
-    const float held = std::hypot(heldX, heldY);
-    if (held > 1e-3f) {
-        heldX /= held;
-        heldY /= held;
-    } else {
-        heldX = heldY = 0.0f;
+    // The input as the AI gets it: a direction in 256ths of a turn (or none)
+    // and the dash button. We simulate exactly what we send.
+    const bool held = std::hypot(input.x, input.y) > 0.1f;
+    const uint8_t dir = held ? net::dirByte(input.x, input.y) : 0;
+    dashLatch_ = dashLatch_ || input.dash;
+
+    // Our player runs on the AI's step clock: step k ends at network time k / 120.
+    const net::ClockDelta &clock = cr_.clockDelta();
+    const int64_t target = clock.localToStep(now);
+    constexpr int64_t kMaxSteps = 240;  // 2 s; after a longer stall, wait for the AI's word
+    if (target - prediction_.step() > kMaxSteps) {
+        prediction_.start(target - kMaxSteps, prediction_.state(), prediction_.knowDelay());
     }
-    bool dash = input.dash;
-    while (accumulator_ >= kStep) {
-        prevMove_ = move_;
-        MoveInput mi{input.x, input.y, dash};
-        dash = false;  // a press dashes once
-        if (stepMovement(move_, mi, rules, arena, static_cast<float>(kStep))) {
-            local_->sendDash();
-            if (world_) world_->playerDashed(local_->doId());
-            ++counters_.dashes;
-            dashRecords_.push_back(DashRecord{now, {}, {}});
-        }
-        // Soft collisions with the (interpolated) other players.
-        for (const auto &kv : players_) {
-            if (!kv.second->isLocal()) {
-                separateFrom(move_, kv.second->x(), kv.second->y(), 2.0f * rules.playerRadius);
+    if (target > prediction_.step()) {
+        const Prediction::Others others = otherPositions();
+        auto advance = [&] {
+            if (prediction_.advance(rules, arena, others)) {
+                if (world_) world_->playerDashed(local_->doId());
+                ++counters_.dashes;
+                dashRecords_.push_back(DashRecord{now, {}, {}});
             }
+        };
+        // Catch up with what was sent; this frame's input starts at the
+        // step that ends now, not at a step already past.
+        while (prediction_.step() < target - 1) advance();
+        net::InputCmd cmd;
+        if (prediction_.setInput(held, dir, dashLatch_, now, viewDelay_.wire(), cmd)) {
+            cmd.sampleDelay = sampleDelay();
+            cr_.sendInput(cmd);
         }
-        resolveCollisions(move_, rules, arena);
-        accumulator_ -= kStep;
+        dashLatch_ = false;
+        advance();
     }
+    counters_.inputSends = prediction_.inputsSent();
+    const MoveState &me = prediction_.state();
 
     // What this player sees as a hit: touching someone while dashing (victims
     // are immune for the server's hitCooldown, 0.8 s, after being hit).
@@ -419,42 +443,49 @@ void GameClient::simulate(double now, double dt, PlayerInput input) {
         for (const auto &kv : players_) {
             const ArenaPlayer *p = kv.second;
             const uint8_t slot = p->slot();
-            if (p->isLocal() || slot == net::kNoSlot || dash.seen.test(slot)) continue;
+            if (p == local_ || slot == net::kNoSlot || dash.seen.test(slot)) continue;
             if (now - lastHitAt_[slot] < 0.8) continue;
-            if (std::hypot(p->x() - move_.x, p->y() - move_.y) <= touch) {
+            if (std::hypot(p->x() - me.x, p->y() - me.y) <= touch) {
                 dash.seen.set(slot);
             }
         }
     }
     settleDashes(now, false);
 
-    // Network gets the newest state; the screen an interpolated one.
-    // Our body turns toward where we move as the others' bodies do.
-    shownHeading_ = turnToward(shownHeading_, move_.heading, static_cast<float>(dt));
-    local_->setLocalPose(move_.x, move_.y, shownHeading_, move_.vx, move_.vy);
-    local_->setLocalInput(heldX, heldY, move_.dashLeft);
-    local_->broadcastPose(now, viewDelay_.wire(), rules);
-    counters_.positionSends = local_->positionSends();
-    if (world_) {
-        const float a = static_cast<float>(accumulator_ / kStep);
-        world_->setPlayerPose(local_->doId(), prevMove_.x + (move_.x - prevMove_.x) * a,
-                              prevMove_.y + (move_.y - prevMove_.y) * a, shownHeading_);
+    // On screen: between the last two steps, plus what is left of any
+    // correction (a knockback we heard of late, mostly), fading out quickly
+    // but never faster than RemoteMotion's corrections, so it is a slide, not
+    // a lurch. Our body turns toward where we move as the others' bodies do.
+    const float left = std::hypot(smoothX_, smoothY_);
+    if (left > 1e-4f) {
+        const float fdt = static_cast<float>(dt);
+        const float shrink = std::min(left * (1.0f - std::exp(-fdt / 0.1f)), RemoteMotion::kMaxCorrectionSpeed * fdt);
+        smoothX_ *= (left - shrink) / left;
+        smoothY_ *= (left - shrink) / left;
     }
+    const MoveState &prev = prediction_.previous();
+    const float a = std::clamp(static_cast<float>((now - clock.delta()) * net::kStepsPerSec -
+                                                  static_cast<double>(prediction_.step())),
+                               0.0f, 1.0f);
+    const float shownX = prev.x + (me.x - prev.x) * a + smoothX_;
+    const float shownY = prev.y + (me.y - prev.y) * a + smoothY_;
+    shownHeading_ = turnToward(shownHeading_, me.heading, static_cast<float>(dt));
+    local_->setLocalPose(shownX, shownY, shownHeading_);
+    if (world_) world_->setPlayerPose(local_->doId(), shownX, shownY, shownHeading_);
 
     // Predict pickups: hide the orb at once, the server confirms (or not).
     if (game_->roundState() == RoundState::Playing) {
         const float reach = rules.playerRadius + rules.orbRadius;
         for (const auto &kv : game_->orbs()) {
             if (predictedOrbs_.count(kv.first)) continue;
-            if (std::hypot(kv.second.x - move_.x, kv.second.y - move_.y) <= reach) {
+            if (std::hypot(kv.second.x - me.x, kv.second.y - me.y) <= reach) {
                 predictedOrbs_[kv.first] = now;
                 if (world_) world_->setOrbHidden(kv.first, true);
-                local_->sendSoon();  // so the AI confirms it without waiting for a heartbeat
             }
         }
     }
     for (auto it = predictedOrbs_.begin(); it != predictedOrbs_.end();) {
-        if (now - it->second > 0.75) {  // never confirmed: show it again
+        if (now - it->second > 1.0) {  // never confirmed: show it again
             if (world_) world_->setOrbHidden(it->first, false);
             it = predictedOrbs_.erase(it);
         } else {
@@ -499,11 +530,12 @@ PlayerInput GameClient::botInput(double now) {
     }
     const Rules &rules = game_->rules();
     const ArenaLayout &arena = game_->layout();
+    const MoveState &me = prediction_.state();
     float tx = wanderX_, ty = wanderY_;
     float best = 1e9f;
     for (const auto &kv : game_->orbs()) {
         if (predictedOrbs_.count(kv.first)) continue;
-        const float d = std::hypot(kv.second.x - move_.x, kv.second.y - move_.y) - (kv.second.kind ? 6.0f : 0.0f);
+        const float d = std::hypot(kv.second.x - me.x, kv.second.y - me.y) - (kv.second.kind ? 6.0f : 0.0f);
         if (d < best) {
             best = d;
             tx = kv.second.x;
@@ -516,7 +548,7 @@ PlayerInput GameClient::botInput(double now) {
         wanderY_ = u(rng_) * arena.radius * 0.6f;
         wanderUntil_ = now + 3.0;
     }
-    float dx = tx - move_.x, dy = ty - move_.y;
+    float dx = tx - me.x, dy = ty - me.y;
     const float dist = std::hypot(dx, dy);
     if (dist > 0.01f) {
         dx /= dist;
@@ -524,7 +556,7 @@ PlayerInput GameClient::botInput(double now) {
     }
     // Steer around pillars in the way.
     for (const Pillar &p : arena.pillars) {
-        const float px = p.x - move_.x, py = p.y - move_.y;
+        const float px = p.x - me.x, py = p.y - me.y;
         const float along = px * dx + py * dy;
         if (along <= 0.0f || along > std::min(dist, 6.0f)) continue;
         const float side = px * -dy + py * dx;  // > 0: pillar on our left
@@ -541,11 +573,11 @@ PlayerInput GameClient::botInput(double now) {
     in.x = dx;
     in.y = dy;
     // Dash at someone just ahead, or toward a far gold orb.
-    if (move_.dashCooldown <= 0.0f) {
+    if (me.dashCooldown <= 0.0f) {
         for (const auto &kv : players_) {
             const ArenaPlayer *p = kv.second;
-            if (p->isLocal()) continue;
-            const float ox = p->x() - move_.x, oy = p->y() - move_.y;
+            if (p == local_) continue;
+            const float ox = p->x() - me.x, oy = p->y() - me.y;
             const float od = std::hypot(ox, oy);
             if (od < 5.0f && od > 0.1f && (ox * dx + oy * dy) / od > 0.7f) {
                 in.dash = true;
@@ -633,6 +665,10 @@ void GameClient::updateHud(double now, double dt) {
         st.center = "Entering the arena ...";
         st.status = "connected";
         break;
+    case Phase::Joining:
+        st.center = "Joining the game ...";
+        st.status = "connected";
+        break;
     case Phase::Rejected:
         st.center = "The server refused the connection:\n" + rejectReason_ + "\n\nPress Esc to quit";
         st.status = "rejected";
@@ -665,7 +701,7 @@ void GameClient::updateHud(double now, double dt) {
             row.name = kv.second->name();
             row.color = kv.second->colorIndex();
             row.score = kv.second->slot() == net::kNoSlot ? 0 : game_->scoreOf(kv.second->slot());
-            row.local = kv.second->isLocal();
+            row.local = kv.second == local_;
             st.scores.push_back(row);
         }
         std::sort(st.scores.begin(), st.scores.end(), [](const ScoreRow &a, const ScoreRow &b) {
@@ -679,7 +715,7 @@ void GameClient::updateHud(double now, double dt) {
 
 float GameClient::dashReady() const {
     const float cd = rules().dashCooldown;
-    return cd > 0.0f ? 1.0f - std::clamp(move_.dashCooldown / cd, 0.0f, 1.0f) : 1.0f;
+    return cd > 0.0f ? 1.0f - std::clamp(prediction_.state().dashCooldown / cd, 0.0f, 1.0f) : 1.0f;
 }
 
 // --------------------------------------------------------------- GameEvents
@@ -691,7 +727,7 @@ void GameClient::onGameGenerated(ArenaGame &game) {
         world_->setOrbs(game.orbs());
     }
     if (phase_ == Phase::EnteringArena || phase_ == Phase::SyncingTime) {
-        createLocalPlayer();
+        requestJoin();
     }
 }
 
@@ -795,20 +831,42 @@ void GameClient::onSlot(uint8_t slot, uint32_t doId) {
         s.name = s.player->name();
         s.color = s.player->colorIndex();
         s.player->setSlot(slot);
-        if (s.player->isLocal()) localSlot_ = slot;
+        if (s.player == local_) localSlot_ = slot;
     }
 }
 
-void GameClient::onMove(uint8_t slot, const net::WireState &state) {
+// The second most of the recent ones: one hitch does not hold bumps back.
+uint8_t GameClient::sampleDelay() const {
+    uint8_t most = 0, next = 0;
+    for (uint8_t d : sampleDelays_) {
+        if (d > most) {
+            next = most;
+            most = d;
+        } else if (d > next) {
+            next = d;
+        }
+    }
+    return next;
+}
+
+void GameClient::onMove(uint8_t slot, const net::WireState &state, uint16_t sentStep) {
     Slot &s = slots_[slot];
     if (s.player != nullptr) [[likely]] {
-        if (!s.player->isLocal()) {
-            const double lateness = s.player->applyState(state, now_, viewDelay_.value(), rules());
+        if (s.player != local_) {
+            const double lateness = s.player->applyState(state, sentStep, now_, viewDelay_.value(), rules());
+            if (prediction_.started()) {
+                // How late it is for bumping into (Prediction: by the rule
+                // in SelfState::knowDelay), by our clock; the AI hears of it.
+                const int64_t late = prediction_.step() - cr_.clockDelta().resolveStep(sentStep, now_);
+                sampleDelays_[sampleDelayNext_++ % sampleDelays_.size()] =
+                    static_cast<uint8_t>(std::clamp<int64_t>(late, 0, 255));
+            }
             // Live samples only; cached ones of idle players can be minutes old.
             if (lateness >= 0.0 && lateness < 0.5) viewDelay_.addLateness(lateness);
         }
     } else if (s.doId != 0) {
         s.state = state;  // the player's generate has not arrived yet
+        s.sentStep = sentStep;
         s.hasState = true;
     }
 }
@@ -822,23 +880,49 @@ void GameClient::onPong(uint16_t context) {
     counters_.pingMaxMs = std::max(counters_.pingMaxMs, ms);
 }
 
-void GameClient::onKnockback(float vx, float vy) {
-    applyKnockback(move_, vx, vy);
-    if (world_) world_->shake(0.4f);
+void GameClient::onJoined(uint8_t slot, uint32_t playerId) {
+    myDoId_ = playerId;
+    localSlot_ = slot;
+    auto it = players_.find(playerId);
+    if (it != players_.end()) {
+        local_ = it->second;
+        local_->setControlled(true);
+        if (world_) world_->addPlayer(playerId, local_->name(), local_->colorIndex(), true);  // as ours
+    }
+    startPlaying();
 }
 
-void GameClient::onCorrectPosition(float x, float y) {
-    ++counters_.corrections;
-    LOG_WARN("server corrected our position to (%.1f, %.1f)", x, y);
-    move_.x = x;
-    move_.y = y;
-    move_.vx = move_.vy = 0.0f;
-    prevMove_ = move_;
-    if (local_) {
-        shownHeading_ = move_.heading;
-        local_->setLocalPose(move_.x, move_.y, shownHeading_, 0.0f, 0.0f);
-        local_->setLocalInput(0.0f, 0.0f, 0.0f);
-        local_->broadcastPose(now_, viewDelay_.wire(), rules(), true);
+// Our player's exact state from the AI: the spawn, or a check of our
+// prediction (Prediction::reconcile), whose correction fades out on screen.
+void GameClient::onSelf(const net::SelfState &msg) {
+    if (game_ == nullptr) return;
+    ++counters_.selfs;
+    const int64_t step = cr_.clockDelta().resolveStep(msg.step, now_);
+    const bool first = !prediction_.started();
+    float dx = 0.0f, dy = 0.0f;
+    const MoveState *mine = prediction_.predictedAt(step);
+    const float errorCm = mine ? std::hypot(mine->x - msg.x, mine->y - msg.y) * 100.0f : 0.0f;
+    const bool changed = prediction_.reconcile(msg, step, game_->rules(), game_->layout(), otherPositions(), dx, dy);
+    smoothX_ -= dx;  // keep showing where we were, then fade to the truth
+    smoothY_ -= dy;
+    if (changed) {
+        const bool event = (msg.flags & (net::kSelfKnock | net::kSelfSnap)) != 0;
+        if (!event && !first && errorCm > 5.0f) {
+            ++counters_.corrections;
+            counters_.correctionMaxCm = std::max(counters_.correctionMaxCm, static_cast<double>(errorCm));
+            LOG_DEBUG("our prediction was %.1f cm off at step %lld (%s)", errorCm, static_cast<long long>(step),
+                      prediction_.lastStale() ? "an input reached the server late" : "bumped differently");
+        }
+        if ((msg.flags & net::kSelfSnap) || std::hypot(smoothX_, smoothY_) > 8.0f) {
+            smoothX_ = smoothY_ = 0.0f;  // placed there: show it at once
+        }
+    }
+    if (msg.flags & net::kSelfKnock) {
+        if (world_) world_->shake(0.4f);
+    }
+    if (first) {
+        shownHeading_ = prediction_.state().heading;
+        startPlaying();
     }
 }
 
@@ -851,14 +935,21 @@ void GameClient::onPlayerGenerated(ArenaPlayer &player) {
         s.name = player.name();
         s.color = player.colorIndex();
         player.setSlot(static_cast<uint8_t>(i));
-        if (s.hasState && !player.isLocal()) player.applyState(s.state, now_, viewDelay_.value(), rules());
+        if (s.hasState && player.doId() != myDoId_) {
+            player.applyState(s.state, s.sentStep, now_, viewDelay_.value(), rules());
+        }
         s.hasState = false;
         break;
     }
+    if (player.doId() == myDoId_) {
+        local_ = &player;
+        player.setControlled(true);
+    }
     if (world_) {
-        world_->addPlayer(player.doId(), player.name(), player.colorIndex(), player.isLocal());
+        world_->addPlayer(player.doId(), player.name(), player.colorIndex(), &player == local_);
         world_->setPlayerPose(player.doId(), player.x(), player.y(), player.h());
     }
+    if (&player == local_) startPlaying();
 }
 
 void GameClient::onPlayerDisabled(ArenaPlayer &player) {
@@ -869,6 +960,14 @@ void GameClient::onPlayerDisabled(ArenaPlayer &player) {
     if (world_) world_->removePlayer(player.doId());
     if (&player == local_) {
         local_ = nullptr;
+        if (!closing_ && cr_.isReady() && (phase_ == Phase::Playing || phase_ == Phase::Joining)) {
+            // The AI removed our player: ask for a new one.
+            myDoId_ = 0;
+            prediction_.stop();
+            playingSince_ = -1.0;
+            setPhase(Phase::EnteringArena);
+            requestJoin();
+        }
     }
 }
 

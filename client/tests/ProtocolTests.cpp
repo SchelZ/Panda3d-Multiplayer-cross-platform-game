@@ -70,35 +70,46 @@ ARENA_TEST(protocol_field_round_trip_and_validation) {
     net::ClientRepository cr;
     CHECK(loadDc(cr));
     const DCClass *player = cr.dcFile().get_class_by_name("DistributedArenaPlayer");
-    const DCField *correct =
-        cr.dcFile().get_class_by_name("DistributedArenaGame")->get_field_by_name("correctPosition");
+    const DCClass *game = cr.dcFile().get_class_by_name("DistributedArenaGame");
+    const DCField *joined = game->get_field_by_name("joined");
 
     DCPacker p;
-    p.begin_pack(correct);
+    p.begin_pack(joined);
     p.push();
-    net::FieldWriter(p).f64(12.345).f64(-7.891);
+    net::FieldWriter(p).u32(7).u32(3000004);
     p.pop();
     CHECK(p.end_pack());
-    CHECK(p.get_length() == 4);  // two int16 / 100
-    CHECK(correct->validate_ranges(p.get_bytes()));
+    CHECK(p.get_length() == 5);  // uint8 slot, uint32 doId
+    CHECK(joined->validate_ranges(p.get_bytes()));
 
     DCPacker u;
     u.set_unpack_data(p.get_bytes());
-    u.begin_unpack(correct);
+    u.begin_unpack(joined);
     u.push();
     net::FieldReader r(u);
-    CHECK_NEAR(r.f64(), 12.35, 1e-6);  // centimetres
-    CHECK_NEAR(r.f64(), -7.89, 1e-6);
+    CHECK(r.u32() == 7);
+    CHECK(r.u32() == 3000004);
     u.pop();
     CHECK(u.end_unpack());
 
     // Truncated or padded data is rejected.
     vector_uchar bytes = p.get_bytes();
     bytes.pop_back();
-    CHECK(!correct->validate_ranges(bytes));
+    CHECK(!joined->validate_ranges(bytes));
     bytes.push_back(0);
     bytes.push_back(0);
-    CHECK(!correct->validate_ranges(bytes));
+    CHECK(!joined->validate_ranges(bytes));
+
+    // requestJoin's color is uint8(0-11): 12 is refused before the AI sees it.
+    const DCField *requestJoin = game->get_field_by_name("requestJoin");
+    for (int color : {11, 12}) {
+        DCPacker j;
+        j.begin_pack(requestJoin);
+        j.push();
+        net::FieldWriter(j).str("Bob").u32(static_cast<uint32_t>(color));
+        j.pop();
+        CHECK(j.end_pack() == (color <= 11));
+    }
 
     // string(1-16): a 17-byte name cannot even be packed.
     const DCField *setName = player->get_field_by_name("setName");

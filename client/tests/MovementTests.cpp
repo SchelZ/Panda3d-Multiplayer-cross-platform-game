@@ -1,9 +1,12 @@
 #include "Test.h"
 
 #include "game/Movement.h"
+#include "net/Protocol.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <iterator>
 
 using namespace arena::game;
 
@@ -74,33 +77,63 @@ ARENA_TEST(movement_knockback_and_separation) {
 // The AI rejects movement faster than its speed budget (see
 // DistributedArenaGameAI.onPlayerMoved). An honest client running and dashing
 // as often as allowed must never trip it, or players would get corrected.
-ARENA_TEST(movement_never_trips_the_server_speed_check) {
+ARENA_TEST(movement_matches_the_ai_reference_trajectory) {
+    // The AI moves every player with server/arena/motion.py and this client
+    // predicts its own with Movement.cpp: they must agree. Reference values
+    // from the Python code for the same script (server/tests/test_motion.py
+    // checks the Python side against the same numbers): running, turning,
+    // dashes (one refused by the cooldown), a knockback, the central pillar
+    // and the arena wall.
     Rules r;
-    ArenaLayout a = openArena();
+    ArenaLayout a;
+    a.radius = 34.0f;
+    a.pillars = {{0.0f, 0.0f, 2.6f},    {16.2f, 9.3f, 1.4f},   {0.0f, 18.7f, 1.4f}, {-16.2f, 9.3f, 1.4f},
+                 {-16.2f, -9.4f, 1.4f}, {-0.0f, -18.7f, 1.4f}, {16.2f, -9.4f, 1.4f}};
+    auto input = [](int k) {
+        struct In { bool held; uint8_t dir; bool dash; };
+        if (k < 120) return In{true, 0, false};
+        if (k < 240) return In{true, 64, k == 120};
+        if (k < 300) return In{false, 0, false};
+        if (k < 700) return In{true, 160, k == 400 || k == 600};
+        if (k < 900) return In{true, 32, k == 820};
+        return In{true, 200, k == 1000 || k == 1300};
+    };
+    const double expected[][7] = {  // step, x, y, vx, vy, dashCooldown, stun
+        {99, 11.572917, -3.000000, 9.000000, 0.000000, 0.0000, 0.0000},
+        {199, 13.072917, 7.384375, 0.000000, 9.000000, 0.9417, 0.0000},
+        {299, 13.072917, 11.311458, 0.000000, 0.000000, 0.1083, 0.0000},
+        {399, 8.425163, 6.663704, -6.363961, -6.363961, 0.0000, 0.0000},
+        {499, 5.232287, -1.091518, 0.495459, -5.792218, 0.7750, 0.0000},
+        {599, 0.462809, -6.350324, -6.363961, -6.363961, 0.0000, 0.0000},
+        {699, -7.940713, -14.753846, -6.363961, -6.363961, 0.7750, 0.0000},
+        {799, -5.312043, -12.125177, 6.363961, 6.363961, 0.0000, 0.0000},
+        {899, 3.091479, -3.721654, 6.363961, 6.363961, 0.9417, 0.0000},
+        {999, 5.406415, -8.269672, 1.755813, -8.827068, 0.1083, 0.0000},
+        {1099, 6.869592, -15.625562, 1.755813, -8.827068, 0.0000, 0.0000},
+        {1199, 8.332770, -22.981451, 1.755813, -8.827068, 0.0000, 0.0000},
+        {1299, 9.795947, -30.337341, 1.755813, -8.827068, 0.0000, 0.0000},
+        {1399, 8.711559, -31.931379, -0.799673, 0.498415, 0.7750, 0.0000},
+        {1499, 8.264507, -32.154905, -0.533894, -0.043514, 0.0000, 0.0000},
+    };
     MoveState s;
-    s.x = -25.0f;
-    const double tolerance = 1.3, bankSeconds = 1.5, slack = 0.6;
-    const double maxBudget = r.maxSpeed * tolerance * bankSeconds;
-    double budget = maxBudget, lastSample = 0.0, t = 0.0;
-    float vx = s.x, vy = s.y;
-    int violations = 0;
-    for (int i = 0; i < 120 * 20; ++i) {
-        const bool dashed = stepMovement(s, MoveInput{std::cos(t * 0.3f) > 0 ? 1.0f : -1.0f, 0.3f, true}, r, a, kDt);
-        t += kDt;
-        if (dashed) budget += r.dashSpeed * r.dashTime * tolerance;
-        if (t - lastSample >= 0.05) {  // 20 Hz broadcasts, int16/10 quantised
-            const double qx = std::round(s.x * 10.0) / 10.0, qy = std::round(s.y * 10.0) / 10.0;
-            budget = std::min(budget + r.maxSpeed * tolerance * (t - lastSample), std::max(maxBudget, budget));
-            const double d = std::hypot(qx - vx, qy - vy);
-            if (d > budget + slack) {
-                ++violations;
-            } else {
-                budget = std::max(0.0, budget - d);
-                vx = static_cast<float>(qx);
-                vy = static_cast<float>(qy);
-            }
-            lastSample = t;
+    s.x = 5.0f;
+    s.y = -3.0f;
+    size_t next = 0;
+    for (int k = 0; k < 1500; ++k) {
+        const auto in = input(k);
+        const MoveInput mi{in.held ? arena::net::dirX(in.dir) : 0.0f, in.held ? arena::net::dirY(in.dir) : 0.0f,
+                           in.dash};
+        stepMovement(s, mi, r, a, kDt);
+        if (k == 450) applyKnockback(s, 10.0f, -5.0f);
+        if (next < std::size(expected) && k == static_cast<int>(expected[next][0])) {
+            const double *e = expected[next++];
+            CHECK_NEAR(s.x, e[1], 2e-3);  // 15 s of floats against doubles
+            CHECK_NEAR(s.y, e[2], 2e-3);
+            CHECK_NEAR(s.vx, e[3], 1e-3);
+            CHECK_NEAR(s.vy, e[4], 1e-3);
+            CHECK_NEAR(s.dashCooldown, e[5], 1e-3);
+            CHECK_NEAR(s.stun, e[6], 1e-3);
         }
     }
-    CHECK(violations == 0);
+    CHECK(next == std::size(expected));
 }

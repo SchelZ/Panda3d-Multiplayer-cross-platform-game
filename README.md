@@ -406,13 +406,16 @@ edges, but a texture and a shader; for one flat logo the polygons are simpler an
 
 The game follows the manual's architecture: one **ServerRepository**, one **AI repository**
 (a `ClientRepository` with `dcSuffix='AI'`, see *AI Repositories*), and client repositories.
+The AI is the authority: it creates every player, moves every player and decides every
+pickup and hit. A client only says what its player wants to do.
 
 ```
- C++ client ──┐                               ┌─────────── arena_server.py (one process) ─────────┐
+ C++ client ──┐   inputs ▶                    ┌─────────── arena_server.py (one process) ─────────┐
  C++ client ──┼── TCP 4400 ──▶ ArenaServerRepository ◀── loopback ──▶ ArenaAIRepository         │
- Python bot ──┘    (relay, validation, limits)  │                       TimeManagerAI     zone 1 │
-                                                │                       DistributedArenaGameAI 2 │
-                                                └────────────────────────────────────────────────┘
+ Python bot ──┘   ◀ positions  (relay, validation, │                       TimeManagerAI     zone 1 │
+                                limits)          │                       DistributedArenaGameAI 2 │
+                                                 │                       (simulates every player) │
+                                                 └────────────────────────────────────────────────┘
 ```
 
 * **DC files** (`common/direct.dc` pinned from 1.10.16, `common/arena.dc`) define the
@@ -420,90 +423,185 @@ The game follows the manual's architecture: one **ServerRepository**, one **AI r
   same order. The DC hash is checked during the handshake.
 * **Connect flow** (as in *Client Repositories*): connect → hello → `SET_DOID_RANGE` →
   interest in zone 1 → the `TimeManager` syncs the clock → interest in zones 1+2 → the
-  client sees `DistributedArenaGame` and creates its own `DistributedArenaPlayer`.
-* **Players** (`DistributedArenaPlayer`) are owned by their client and have just two DC
-  fields, name and color, sent once. Each client simulates its own movement at a fixed
-  120 Hz step (instant response). Movement itself travels as compact binary messages (see
-  *Wire format*), and every player is named on the wire by a one-byte **slot** that the
-  server assigns. Network timestamps come from a C++ port of `ClockDelta`.
-* **Input-aware prediction** (`predictMotion` in `client/src/game/Movement.cpp`). Every
-  movement sample carries position, velocity **and the movement input being held**.
-  Movement is deterministic (velocity moves toward input × max speed at a fixed
-  acceleration; a dash holds its velocity for 27 physics steps), so from one sample everyone
-  predicts the acceleration, the cruising and the braking exactly, in closed form, down
-  to the 120 Hz step's rounding. A dash sample is rewound to the dash's start, so
-  receivers know exactly when it ends.
-* **Dead reckoning** (`client/src/game/DeadReckoning.cpp`). The sender runs the same
-  prediction and sends only when it would go wrong: it is already more than 12 cm or
-  1 m/s off, or would be within the next 0.15 s. That last case is any change of input:
-  pressing, releasing, turning. So a short tap costs exactly two samples (press, release), a
-  straight run a heartbeat every 0.5 s, and standing still nothing. Samples go out at most
-  20 times a second.
-* **Drawing remote players** (`client/src/game/RemoteMotion.cpp`). Remote players are
-  drawn a little in the past, by a **view delay** of about the 90th percentile of how
-  late their samples arrive (it adapts slowly, 20–250 ms). So a sample usually arrives
-  before the drawing reaches its time, and takes over at exactly that time. Stops,
-  reversals, taps and dashes are drawn when and where they happened: no overshoot and no
-  sliding back. A sample later than that takes over at once. Either way the drawing never
-  jumps: the position error left at the switch fades out with a smooth cubic, in at least
-  0.1 s and never faster than 8 m/s. Only errors over 3 m (respawns) snap.
-* **Rotation.** Players face where they move, so heading is not sent. Every body, the
-  local player's included, turns toward its drawn direction of motion quickly but at most
-  900°/s (`turnToward`), so a reversal is a short spin instead of a snap.
-* **The AI is authoritative** for everything that scores. It sees every movement sample,
-  rejects impossible movement (speed budget on arrival times, bounds) and tells the owner
-  to snap back (`correctPosition`). It detects orb pickups along each movement segment and
-  sends `knockback`/`pong` as targeted updates to one client. Late joiners get the game
-  state from the `required`/`ram` fields (`REQUEST_GENERATES`), and every player's slot
-  and last movement sample from the server's cache, before the players' generates arrive.
+  client sees `DistributedArenaGame` and **asks to join** (`requestJoin`, with the name and
+  color it would like). The AI cleans the name up, creates the `DistributedArenaPlayer`
+  where it chooses (a free spot, facing the centre), gives it a one-byte **slot** and tells
+  the client which player is its own (`joined`). A client cannot create any object.
+* **Inputs, only when they change** (`CLIENT_INPUT`, 10 bytes on the wire): which way the
+  player steers (in 256ths of a turn, or not at all) and the dash button. A client sends
+  one when the player presses, releases, dashes or turns by more than 2.8° (at most 30
+  turns a second), and nothing while it holds a direction or stands still. Every input
+  names the 120 Hz **step** it starts at, on the shared network clock.
+* **The AI moves everyone** (`server/arena/simulation.py`) with the same movement code
+  as the client (`server/arena/motion.py` is a line-by-line twin of
+  `client/src/game/Movement.cpp`; a reference trajectory with dashes, a knockback, a pillar
+  and the wall checks both agree). It runs each player a few steps behind real time: as
+  late as that client's recent inputs arrived (but for the latest one), plus a step. So it
+  applies nearly every input at exactly the step the client named. An input later than
+  that is applied at the next step it simulates, and one claiming to come from more than
+  0.2 s in the future is not believed. Positions, speeds, dashes, pickups and hits never
+  come from a client, so a hacked client cannot teleport, speed up, dash more often or
+  move anyone else: it can only steer, like everyone.
+* **Prediction** (`client/src/game/Prediction.cpp`). The client simulates its own player
+  from its own inputs at the same steps, so it responds the moment a key is pressed, and
+  normally ends up exactly where the AI puts it. Whenever the AI's result may differ, it
+  sends the player's exact state at one step (SELF): after a knockback, bumping
+  into someone, an input it got late, the spawn, and once a second while moving to wash
+  out rounding. The client continues from that state and replays its inputs since. A
+  difference fades out on screen in about 0.1 s instead of jumping.
+* **Bumping into each other** is decided by the AI too, but on what that player's own
+  client knows, so it can be predicted exactly: each player pushes off another where that
+  one's newest sample sent at least `knowDelay` steps before says it is. The AI picks the
+  delay so the client has those samples in time, and tells the client in SELF; both sides
+  switch at the same step. How late the client's inputs arrive does not say how late the
+  samples reach it: the client's clock is only synced to within half a round trip, and a
+  client whose clock runs a little ahead needs the samples sooner. So the client also says,
+  in its inputs, how many steps late (by its own clock) the samples have been reaching it,
+  and the AI keeps `knowDelay` above that. A dashing or knocked-back player flies through.
+* **Everyone else** gets a player's movement as samples: position,
+  velocity, steering input and heading. Movement is deterministic (velocity moves toward
+  input × max speed at a fixed acceleration; a dash holds its velocity for 27 steps), so
+  from one sample everyone predicts the acceleration, cruising and braking exactly, in
+  closed form (`predictMotion`). The AI therefore sends a sample only when that prediction
+  would go wrong (dead reckoning: more than 12 cm or 1 m/s off now, or within the next
+  0.15 s, i.e. a new input). A tap costs two samples, a straight run a heartbeat every
+  0.5 s, standing still nothing.
+* **One message per batch.** 30 times a second the AI sends what changed: the samples due,
+  the game events since the last batch (an orb spawned or collected, a dash hit) and the
+  SELF messages due. The server gives each client everything of that batch that concerns
+  it in one bit-packed `SERVER_FRAME` (`server/arena/frame.py`), so a client gets at most
+  one TCP packet per batch. See *Bandwidth* below.
+* **Drawing other players** (`client/src/game/RemoteMotion.cpp`). They are drawn a little
+  in the past, by a **view delay** of about the 90th percentile of how late their samples
+  arrive (it adapts slowly, 20–500 ms). So a sample usually arrives before the drawing
+  reaches its time, and takes over at exactly that time: stops, reversals, taps and dashes
+  are drawn when and where they happened, with no overshoot and no sliding back. A later
+  sample takes over at once, and the position error left at the switch fades out with a
+  smooth cubic, in at least 0.1 s and never faster than 8 m/s. Only errors over 3 m snap.
+* **Rotation.** The AI decides which way a new player faces and every sample carries the
+  heading, so all screens show a new (or standing) player facing the same way. Moving
+  bodies face where they move and turn toward it at most 900°/s (`turnToward`), so a
+  reversal is a short spin instead of a snap.
 * **Lag-compensated hits** (`DistributedArenaGameAI._checkDashHits`). A dash hits whoever
-  it touched *on the attacker's screen*. The AI keeps one second of each player's samples
-  on that player's own timeline (the timestamp in every sample). It replays each dash in
-  10 ms steps against the victim as the attacker drew it (`server/arena/motion.py`, a
-  line-by-line twin of `RemoteMotion`): with the attacker's view delay, which travels in
-  every sample it sends, and with when each sample reached it. A unit test checks the C++
-  drawing and the Python replay agree to a millimetre. Immunity after a hit is judged the
-  same way. Timestamps are trusted at most 0.4 s into the past, so a client cannot buy a
-  bigger rewind.
+  it touched *on the attacker's screen*: the attacker's path as the AI simulated it (which
+  is what the attacker saw, predicted), against each victim as the attacker drew it. The
+  AI keeps one second of the samples it sent of everyone, and replays the attacker's
+  drawing (`server/arena/motion.py`, a line-by-line twin of `RemoteMotion`, checked to a
+  millimetre by a unit test) with the attacker's view delay, which travels in its inputs,
+  and its latency. Immunity after a hit is judged the same way. The victim's knockback is
+  applied by the AI and reaches the victim's client in SELF.
+* **Nobody sees anyone's address.** Clients only ever connect to the server. Everything
+  they get about other players (objects, slots, samples, scores, chat) is relayed and
+  names players by slot and doId; nothing relayed carries an IP address or port. A test
+  connects two clients from different addresses and checks that neither one's address
+  appears anywhere in what the other received. Only the server operator sees addresses,
+  in the server log.
 * **Latency.** Messages of a frame/tick are batched into one TCP write (`collect-tcp`,
-  flushed once per frame, `TCP_NODELAY`). The server relays movement and requests in the
-  tick they arrive (100 Hz). Measured localhost round trip: about one client frame
-  (~17 ms at 60 fps); the server's share is under 1 ms.
+  flushed once per frame, `TCP_NODELAY`). The server relays inputs to the AI and the AI's
+  answers to the clients in the tick they arrive (100 Hz).
+* **Animations are commands.** Nothing about how a dash or a hit looks crosses the
+  network: a dash is one flag in a sample, a hit is an event naming attacker and victim, a
+  pickup an event naming the orb and the player. Each client plays the animation itself.
 
 ### Wire format
 
-Everything on the wire is binary. Movement, the only high-rate traffic, skips the
-generic field update (message type, sender, object id and field id: 12 bytes of header,
-plus Panda3D's 2-byte length prefix). It uses three message types instead
-(`server/arena/protocol.py`, `client/src/net/Protocol.h`):
+Everything on the wire is binary. Movement and the frequent events skip the generic field
+update (message type, sender, object id and field id: 12 bytes of header, plus Panda3D's
+2-byte length prefix). They use these messages instead (`server/arena/protocol.py`,
+`server/arena/frame.py`, `client/src/net/Protocol.h`, `client/src/net/Frame.h`):
 
 | Message | Payload |
 |---|---|
-| `CLIENT_MOVE` (client → server) | one 10-byte state |
-| `SERVER_MOVES` (server → clients, once per tick) | `uint8` count, then per player `uint8` slot + 10-byte state, the newest of the tick |
+| `CLIENT_INPUT` (client → server) | `uint8` seq, `uint16` step, `uint8` flags (dash, steering, view delay in 8 ms), `uint8` direction, `uint8` how many steps late samples reach it |
+| `SERVER_FRAME` (server → one client, at most once per batch) | bit-packed: the batch's step, then the samples of everyone but the recipient, the events, and the recipient's SELF |
 | `SERVER_SLOTS` (server → clients) | `uint8` slot + `uint32` doId per entry; doId 0 frees a slot |
 
-The 10-byte state:
+Between the server repository and the AI (same process, never seen by players):
+`SERVER_INPUTS` (the tick's inputs, with slots), `AI_FRAME` (a batch: samples as 10-byte
+states, SELF as 21 bytes, events), `AI_SLOT` (a slot bound to a client) and
+`SERVER_CLIENT_LEFT`. The server refuses `AI_*` messages from anyone but the AI.
 
-| Field | Type | Meaning |
-|---|---|---|
-| x, y | `int16` | position in cm |
-| vx, vy | `int8` | velocity in ¼ m/s |
-| flags | `uint8` | bit 0: a dash started here; bit 1: an input is held; bits 2–7: the sender's view delay in 4 ms |
-| dir | `uint8` | held input direction, 256ths of a turn (1.4°) |
-| t | `uint16` | network timestamp (10 ms ticks) |
+A sample has these fields; in a frame each is sent with as few bits as it needs, and only
+when it changed since the player's previous sample (its *baseline*, which every client
+has, since everything comes over one TCP connection in order):
 
-| One movement update | before (`DistributedSmoothNode.setSmXYH`) | now |
+| Field | Range | In a frame |
 |---|---|---|
-| client → server | 18 bytes, no velocity | 14 bytes, with velocity and input |
-| server → each other client | 22 bytes | 11 bytes inside the tick's batch (+5 per batch) |
+| slot | `uint8` | 8 bits |
+| flags | dash started, steering, knocked back | 1 bit steering + 1 bit "an event", then 2 bits if so |
+| age | the step it describes, this many before the batch was sent | 1 bit "same as before" (87% of samples), else 8 bits |
+| dir | steering direction, 256ths of a turn (1.4°) | 1 bit "same as before", else 8 bits; nothing when not steering |
+| vx, vy | velocity in ¼ m/s | the change: 2 bits width class + 3, 5, 7 or 9 bits each |
+| x, y | position in cm | the error of a prediction from the baseline (integer arithmetic, the same on both ends): 2 bits width class + 4, 6, 9 or 18 bits each; median 4–5 bits |
+| heading | where the player faces, 256ths of a turn | 8 bits only below 2 m/s; a moving player faces where it moves, so the receiver works it out from the velocity |
+
+A player's first sample to a client goes in full (8 bits of velocity, 16 of position).
+A typical sample is 4–6 bytes instead of 11. Events: an orb collected is 42 bits, an
+orb spawned 51 bits, a hit 50 bits, instead of 19–21 bytes each as field updates.
+SELF is 14–20 bytes (its timers are mostly zero and cost a bit each) instead of 25.
 
 The other fields are small too. Players are named by `uint8` slot in scores, hits, chat and
-pickups (not a `uint32` doId), `ping`/`pong` take a `uint16`, `knockback` two `int8`s.
-Game messages ("X joined", "Round 3 - go!", round results, shutdown) are a 4-byte
-`notice(kind, slot, value)` that the client turns into text. The only strings left are
-the player's name (sent once) and chat lines. Compression (zlib) would not help:
-messages are 10–20 bytes, below what a compressor needs to save anything.
+pickups (not a `uint32` doId), and `ping`/`pong` take a `uint16`. Game messages ("X joined",
+"Round 3 - go!", round results, shutdown) are a 4-byte `notice(kind, slot, value)` that the
+client turns into text. The only strings left are the player's name (asked for once) and
+chat lines.
+
+### Bandwidth
+
+Measured with 8 players (7 C++ bots and a Python bot) on the server, per player and second,
+before this protocol:
+
+| | bytes of game data | TCP packets | on the wire (IP and TCP headers too) |
+|---|---|---|---|
+| server → player | 960 | 36 | ~2,860 |
+| player → server | 59 | 28 (mostly acknowledgements) | ~1,530 |
+
+Two thirds of what went down the wire, and nearly all of what went up, were packet
+headers: every packet carries about 52 bytes of IP and TCP headers and is acknowledged by
+another packet of the same size. So the number of packets matters more than the bytes in
+them. Of the game data, 64% was movement, 20% orb and hit events (each a DC field update:
+14 bytes of framing around 2–7 bytes of data), 8% everyone's objects sent again to
+everyone whenever someone joined, and 5% SELF.
+
+What was tried on the recorded traffic (`server/arena/frame.py` is what came of it):
+
+| Idea | Result | Used |
+|---|---|---|
+| Change masks and bit-packing: each field with only the bits it needs, unchanged fields as one bit, positions and velocities as small differences from what the previous sample predicts | movement −63%, events −68%, SELF −30%; −42% with the messages' framing | yes |
+| One message per client per batch, with the events and SELF in it | packets 36 → 32 a second at 50 Hz | yes |
+| Fewer batches: 30 a second instead of 50 | packets 32 → 25 a second, on the wire −19% down and −16% up at 100 ms; others are seen on average 7 ms later; dodges, hits and corrections measured the same within run-to-run noise (25 a second was visibly rougher at 100 ms) | 30 a second; `--batch-rate` changes it |
+| Objects sent once per client (the stock server re-sent all of them to everyone whenever someone started listening to a zone) | join traffic −80% | yes |
+| Varints | a varint takes at least a byte, and most of our fields need 1–9 bits; a 2-bit width class in front of fixed widths is smaller | no |
+| Protocol Buffers | movement 1.85× the old hand-packed size (a tag per field, varints) | no |
+| FlatBuffers | movement 2.4× (offsets and alignment, made for reading in place) | no |
+| zlib or LZ4 on each packet alone | +1% / +3%: packets are 15–30 bytes | no |
+| zlib stream, one compressor per connection, flushed every packet | −23% on the old messages, −3.6% on frames (most of what it found was the join traffic, now gone) | no |
+| zstd stream (flushed every packet) or with a trained dictionary | +5% to +14% on frames | no |
+| LZ4 stream with a 64 KB history | −7% on frames | no, not worth a library on phones |
+
+Compression does not pay here: frames have no repetition left for it to find, and
+compressing each 15–30 byte packet alone only adds bytes, as compressors need far
+larger blocks.
+
+The result, per player with 8 players (the same bots and harness before and after; "on
+the wire" adds 52 bytes of IP and TCP headers per packet, as the kernel counted them):
+
+| | before | now |
+|---|---|---|
+| Game data, server → player | 1,000 B/s | 490 B/s (−51%) |
+| Packets, server → player | 37 a second | 26 a second (−30%) |
+| On the wire, down | 2,960 B/s | 1,860 B/s (−37%) |
+| On the wire, up (inputs and the acknowledgements of every packet down) | 1,570 B/s | 1,260 B/s (−20%) |
+| Ping over a 100 ms ± 15 link | 142 ms | 141 ms |
+| Ping over a 24 kbit/s link (a congested 2G-class phone link; `--netsim 100:15:24`) | 261 ms: the old traffic nearly filled the link, and packets queued | 147 ms |
+| Own player corrected (over 5 cm) per client, 40 s over that slow link (both before the bump fix in *Under internet latency*) | 3.7 | 1.7 |
+| Server CPU, 15 players | 13.4% of a core | 13.1% (the bit-packing costs under 1%) |
+
+On a good connection the game feels the same: what limits speed there is latency, not
+bandwidth. On a slow or crowded one (an overloaded café Wi-Fi, a weak mobile signal, a
+2G fallback) the old traffic was big enough to queue behind itself; now it leaves room.
+A player's download still grows with the number of other players, by about 70 bytes of
+game data a second for each.
 
 ### The C++ side of distributed networking
 
@@ -520,10 +618,11 @@ Its packing is checked byte-for-byte against Python in the unit tests.
 Server (`server/arena/server_repository.py`, a hardened `ServerRepository`):
 * handshake with protocol version, DC hash and role; one trusted AI (per-process secret
   token); no doId range, interest or objects before a valid hello;
-* allow-lists: players may create one `DistributedArenaPlayer` in the arena zone and send
-  only the AI's `p2p` request fields. Names and colors cannot change after spawn. A
-  `CLIENT_MOVE` always moves the sender's own slot, so nobody can move anyone else, and
-  it must be exactly 10 bytes;
+* allow-lists: players may create no objects (the AI creates their player when asked)
+  and send only the AI's `p2p` request fields and their inputs. Names and colors cannot
+  change after joining. A `CLIENT_INPUT` always steers the sender's own player, must be
+  exactly 5 bytes, and goes to the AI only, never to other players. The messages the AI
+  uses to talk to the server are refused from anyone else;
 * every generate and update is validated against the DC file before it is relayed. Peers
   never receive malformed data, and the stock server's crash bugs on unknown
   class/field/target are gone;
@@ -543,52 +642,73 @@ Client (`client/src/net/ClientRepository.cpp`):
 * every received field is validated against the DC file before game code sees it. Updates
   are accepted only from the object's owner, which blocks spoofed targeted messages;
 * receive watchdog for half-open connections, bounded work per frame, graceful disconnect
-  on exit, predicted orb pickups with rollback, input-independent fixed-step physics.
+  on exit, predicted orb pickups with rollback, physics on the server's step clock.
 
 ### Measured (this repository's test machine, 4 cores, Linux)
 
 | | |
 |---|---|
-| Server, 15 C++ bot clients | 5.2% of one core with lag compensation, 144–163 msg/s in (1.7–2.0 KB/s), 1,130–1,260 msg/s out |
+| Server, 15 C++ bot clients | 13% of one core: the AI simulates all 15 players at 120 Hz, judges hits and packs one frame per player per batch (the packing is under 1%); about 100 inputs/s in, one message per player per batch out |
 | Windowed client, 1280×720, software OpenGL (llvmpipe) | 22 fps with shaders and shadows, 29 without shadows, 55–64 with `--low`; a GPU renders this scene far faster |
 | Scenery | 283,000 vertices in 2 batches, generated in ~20 ms |
 | Server, idle at 100 Hz tick | ~1.4% of one core |
 | Headless C++ client | ~0.7% of one core |
-| Upload per player | ~0.12 KB/s (movement + pings) |
-| Download per player | ~0.16 KB/s per other moving player |
+| Upload per player | ~0.06 KB/s of inputs and pings (~1.3 KB/s on the wire, mostly TCP acknowledgements) |
+| Download per player | ~0.07 KB/s of game data per other player, in ~26 packets a second (~1.9 KB/s on the wire with 8 players) |
 
 ### Under internet latency
 
 `server/netsim.py` is a TCP proxy that adds a round trip time and random jitter, keeping
 TCP's ordering, so late data arrives in bunches as on a real connection. With
-`e2e_cpp_clients.py --netsim RTT:JITTER --trace-dir DIR`, every client plays through it,
-and logs where it really is and where (and which way) it draws everyone else (`--trace`).
-The test then reports how the netcode coped (`server/tests/trace_stats.py`).
+`e2e_cpp_clients.py --netsim RTT:JITTER --trace-dir DIR`, every client plays through it
+and logs where its player really was (the AI's simulation), where it shows its own player,
+and where (and which way) it draws everyone else (`--trace`). The test then reports how
+the netcode coped (`server/tests/trace_stats.py`).
 
-The numbers below are for 8 C++ bots over 45 s. The bots chase gems and every 5–12 s they
-fidget for 1–2.5 s, like people do: 50–180 ms taps, often reversing. That is the motion
-that is hardest to show smoothly. Before → now, where "before" is the previous version
-(velocity-only samples, drawn in the present with fading offsets):
+The numbers below are for 8 C++ bots and a Python bot over 45 s. The bots chase gems, dash
+at each other and bump into each other, and every 5–12 s they fidget for 1–2.5 s, like
+people do: 50–180 ms taps, often reversing. That is the motion that is hardest to show
+smoothly. Before → now, where "before" is the previous protocol (the same authoritative
+AI, with movement in 50 Hz batches of 11-byte samples and every event and SELF a message
+of its own) and "now" is one bit-packed frame per player 30 times a second:
 
 | Per player-minute (fewer is better) | localhost | 100 ms ± 15 | 200 ms ± 40 |
 |---|---|---|---|
-| **Backtracks**: drawn moving more than 90° away from any way the player really moved in the last 0.3 s (the rubber band after a tap) | 20 → 0.1 | 59 → 2.2 | 76 → 5.6 |
-| **Jumps**: drawn more than 1.5× faster than the real motion | 0.4 → 0.3 | 53 → 2.6 | 232 → 6.4 |
-| **Turn snaps**: heading turned more than 20° in one frame | 106 → 0.3 | 109 → 1.4 | n/a → 0.0 |
+| **Backtracks**: others drawn moving more than 90° away from any way the player really moved in the last 0.3 s (the rubber band after a tap) | 0.1 → 0.4–0.5 | 0.1 → 1.3–1.5 | 23 → 12–24 |
+| **Jumps**: others drawn more than 1.5× (+2 m/s) faster than the real motion, in frames | 1 → 1.0–1.5 | 3 → 3.2–3.4 | 21 → 15–23 |
+| **Turn snaps**: a heading turned more than 20° in one frame | 0.5 → 0.2–0.7 | 0.0 → 0.8–1.0 | 0.4 → 0.4–0.5 |
+| **Own player** sliding faster than that on its own screen, after a correction (mostly a knockback heard of late), in frames | 0.4 → 0–0.2 | 1.2 → 2.7–7 | 7 → 4–13 |
 
 | | localhost | 100 ms ± 15 | 200 ms ± 40 |
 |---|---|---|---|
-| Movement samples per client per second | 10.1 → 7.5 | 10.5 → 7.4 | 10.3 → 8.2 |
-| Upload / download per client (B/s) | 120 / 1,236 → 100 / 1,090 | 126 / 1,286 → 99 / 1,070 | 124 / 1,247 → 109 / 1,118 |
-| Dash contacts the server confirmed | 100% → 99% | 99% → 96% | 95% → 92% |
-| Drawn vs real position at the same moment, mean | 18 → 35 cm | 74 → 134 cm | 149 → 219 cm |
-| Corrections of honest clients | 0 | 0 | 0 |
+| Download per client, game data (B/s) | 1,001 → 490–506 | 1,020 → 492–502 | 1,042 → 473–516 |
+| Upload per client, game data (B/s) | 52 → 55–62 | 52 → 53–59 | 52 → 48–57 |
+| Dash contacts the server confirmed | 95–99% → 91–94% | 85–96% → 79–97% | 83% → 89–91% |
+| Others drawn vs real position at the same moment, mean | 80 → 75–79 cm | 153 → 152 cm | 264 → 254–265 cm |
+| Own player mispredicted by more than 5 cm, per client-minute | 0 → 0 | 2 → 0.2 | 2 → 1.3 |
 
-The last table's position row is the price of the view delay. Others are drawn about one
-delay in the past (at 9 m/s, 10 cm per 11 ms), exactly along the path they took, instead
-of guessed into the present and pulled back. Hits are judged on what the attacker drew, so
-they stay fair. Compared with the first version of this game (fixed 20 Hz `setSmXYH`),
-each client now uploads and downloads about 70% less.
+Ranges are two or more runs. The game data a player downloads is halved, and its packets
+are a third fewer (see *Bandwidth*). Others are drawn about as smoothly and as close to
+where they really are: the smoothness rows move by about as much between two runs of the
+same build as between the two protocols, most of all at 200 ms ± 40. The batches being
+33 ms apart instead of 20 shows mainly in the news of a knockback, which reaches its
+victim on average 7 ms later.
+
+Own-player mispredictions are fewer, for another reason. Measuring this showed that some
+runs had many, all from bumping into others, and that it had nothing to do with the
+batches: every client's clock is synced to the server only to within half a round trip,
+and when it ran a little ahead, the client needed the others' samples a step or two
+sooner than the server allowed for (`knowDelay` came from how late *inputs* arrive). Now
+the client reports how late the samples really reach it (one byte in each input) and the
+server keeps `knowDelay` above that, so on localhost and at 100 ms a player's own movement
+is next to never corrected.
+
+Authority has a price, and it shows on slow, jittery links. The AI runs each player a
+jitter buffer behind real time (it waits for that player's inputs), so everyone sees
+everyone a little later than when clients sent positions themselves. A knockback reaches
+its victim later too, and the victim's own player then slides to where the hit really put
+it. Hits stay judged on what the attacker saw; most misses are a sample reaching the
+attacker later than the AI assumed.
 
 ---
 
@@ -598,9 +718,16 @@ each client now uploads and downloads about 70% less.
 
 * `arena_tests` (C++):
   * clock sync math (incl. 16-bit wrap, as in `ClockDelta.py`);
-  * movement and collisions, and the client physics never tripping the server's speed check;
+  * movement and collisions, and a reference trajectory (running, dashes, a refused dash, a
+    knockback, a pillar, the wall) matching the AI's Python movement code;
+  * prediction against an AI running the same inputs: inputs only on change (thumb wobble
+    and fast turns held back), no correction over 600 frames, an exact catch-up after a
+    knockback and after an input the AI got late, and bumping by the AI's rule;
   * DC packing identical to Python, and validation of truncated/padded/oversized fields;
-  * the 10-byte movement state byte-identical to Python;
+  * the input and the 10-byte state byte-identical to Python;
+  * `SERVER_FRAME` decoding of frames the server's encoder wrote (coded samples, all three
+    events, SELF with and without its step in full, a wrapping step), the same integer
+    prediction as Python, and frames refused when out of step or garbage;
   * the closed-form prediction matching the 120 Hz movement code to millimetres;
   * dead reckoning: a tap costs two samples, heartbeats only on straight runs, the error
     bound on curves and dashes, silence while standing;
@@ -612,26 +739,35 @@ each client now uploads and downloads about 70% less.
   * the touch controls (stick directions and dead zone, the stick following the thumb,
     dash on touch down, pinch zoom, the statistics tap), the connect screen's address
     parsing, LAN discovery packets byte-identical to Python, and the settings file.
-* `server_tests` (Python): `test_server.py` has 21 hostile-client and protocol cases (wrong
-  hash/version, fake AI, messages before hello, forbidden classes, foreign objects,
-  targeted updates, renames, malformed fields and moves, moves without a player,
-  flooding, silent connections, random garbage, the compact relay and the newcomer cache)
-  checked against the server's answer and survival. `test_lagcomp.py` covers
-  lag-compensated hits: the attacker's view under latency, braking predicted from a
-  released input, a tap drawn exactly as it happened, late turns blended without jumps,
-  capped velocities and rewinds, immunity, and the speed check ignoring timestamps.
+* `server_tests` (Python): `test_server.py` has 25 hostile-client and protocol cases (wrong
+  hash/version, fake AI, messages before hello, creating any object, speaking for the AI,
+  foreign objects, targeted updates, renames, malformed fields and inputs, inputs without
+  a player, flooding, silent connections, random garbage), the join (the AI's spawn and
+  heading, the same on every screen, and the newcomer cache), a newcomer getting every
+  object while the others get only its player (not everything again), inputs reaching
+  the AI and nobody else, a speed/teleport cheater spamming inputs, dashes and fake
+  timestamps who never beats the rules, and no client ever receiving another client's
+  address. Its raw client decodes every frame as a real client must.
+  `test_lagcomp.py` drives the real game logic with a fake clock: inputs applied at the
+  step the client named, a late one applied at the next step and reported, input spam,
+  hits judged on the attacker's screen under latency, knockbacks, immunity, bumping by
+  the client's rule, what clients draw (braking, late turns), and everything leaving in
+  batches, with events always ahead of a later field update. `test_frame.py` codes 3,000
+  random frames against baselines and back, and refuses garbage. `test_motion.py` checks
+  the movement code against the reference trajectory the C++ test uses.
   `test_pack.py` checks `tools/make_pack.py`: ChaCha20 against the RFC, and Panda3D's own
   `Multifile` reading what it writes. `test_discovery.py` checks that LAN probes get answers,
   garbage does not, replies never outgrow probes, and replies are rate-limited.
 * `end_to_end` (`server/tests/e2e_cpp_clients.py`): real server, three headless C++ clients
   and a Python bot. Each client must join, see everyone, get pongs, receive every chat
-  line, score, never be corrected, and exit 0. Then the server must stop cleanly on SIGTERM.
+  line, score, predict its own player (at most one misprediction over 5 cm per 10 s), and
+  exit 0. Then the server must stop cleanly on SIGTERM.
   Given several client builds, it mixes them in one game:
   `python server/tests/e2e_cpp_clients.py build/linux/bin/arena_client build/mingw-cross/bin/arena_client.exe --clients 4`
   plays Linux and Windows (Wine) clients against each other.
 * `end_to_end_wan`: the same with four clients behind `netsim.py` (150 ms RTT, up to
-  20 ms jitter each way). There must be no corrections, and every chat line and pong
-  must arrive.
+  20 ms jitter each way). Every chat line and pong must arrive, and mispredictions stay
+  rare (an input that arrives later than usual is applied late).
 
 Load testing: `python server/bots.py --count 16 --port 4400` connects headless Python
 players; `arena_client --headless` runs C++ bots.
@@ -650,6 +786,7 @@ players; `arena_client --headless` runs C++ bots.
 | `--round-time S` | 180 | seconds per round |
 | `--orbs N` | 18 | orbs on the field |
 | `--tick-rate HZ` | 100 | relay latency is at most one tick |
+| `--batch-rate HZ` | 30 | batches of movement and events per second, one TCP packet per player each (see *Bandwidth*) |
 | `--name NAME` | computer name | shown to players on the same network (LAN discovery) |
 | `--no-lan` | | do not answer LAN discovery probes (UDP, same port number) |
 | `--status-interval S` | 30 | status line (players, msg/s, KB/s, kicks, round stats) |
@@ -673,13 +810,16 @@ server/arena_server.py  dedicated server (ServerRepository + AI repository)
 server/bots.py          headless Python players for load tests
 server/netsim.py        latency/jitter/bandwidth proxy for testing under internet conditions
 server/arena/           protocol, policy, hardened ServerRepository, AI repository, game logic,
-                        motion.py (the AI's replay of what clients draw), discovery.py (LAN)
-server/tests/           hardening, lag compensation, pack and end-to-end tests, trace analysis
+                        simulation.py (each player, from its inputs), motion.py (movement,
+                        dead reckoning, the replay of what clients draw), discovery.py (LAN)
+server/tests/           hardening, simulation and lag compensation, movement, pack and
+                        end-to-end tests, trace analysis
 client/src/core/        logging, ChaCha20, the encrypted resource pack (VFS mount), settings
 client/src/net/         C++ ClientRepository, DistributedObject, ClockDelta, TimeManager,
                         LAN discovery
-client/src/game/        game client, players, prediction, dead reckoning, remote drawing,
-                        physics, scenery, world, HUD, touch controls, connect screen
+client/src/game/        game client, players, prediction (our player, from our inputs),
+                        remote drawing, physics, scenery, world, HUD, touch controls,
+                        connect screen
 client/src/app/         window, input, main loop, options, platform layer,
                         AndroidMain.cpp (the Android entry point)
 client/shaders/         GLSL: world (light, shadows, wind, haze) and sky
@@ -699,10 +839,13 @@ tools/vendor_panda3d_direct.py  refreshes third_party/panda3d-direct
 
 * The CMU `ServerRepository` protocol is TCP only. A lost packet delays later ones on
   that connection; there is no UDP channel.
-* Movement is client-authoritative with server-side plausibility checks, not a
-  server-side simulation. Speed hacks and teleports are caught, but subtle cheating within
-  the speed budget is not.
+* The AI simulates every player in Python, at 120 Hz. That costs more server CPU than
+  relaying (see *Measured*), but one process still serves a full arena easily.
+* Authority has a price in latency: everyone sees a player a jitter buffer later than a
+  relay of client positions would show it (the AI waits for that player's inputs), and a
+  misprediction is possible when an input arrives later than usual. It is corrected
+  within a tenth of a second.
 * Lag compensation favours the attacker, as most action games do. With a slow connection
-  on either side, a victim can be hit where the attacker saw them, up to 0.4 s behind
-  where the victim already is on their own screen.
+  on either side, a victim can be hit where the attacker saw them, a few tenths of a
+  second behind where the victim already is on their own screen.
 * One Python process serves one arena. Run more processes on other ports for more arenas.

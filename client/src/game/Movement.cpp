@@ -9,6 +9,11 @@ namespace {
 constexpr float kRadToDeg = 57.29577951308232f;
 constexpr float kDegToRad = 0.017453292519943295f;
 constexpr float kBounce = 0.35f;  // fraction of impact speed reflected
+// The AI runs this same code in Python (doubles) for every player, and this
+// client predicts its own player with it (floats), so boundaries are kept
+// clear of rounding: timers count as run out within kTimerEps (far below a
+// step, Movement.h), "faster than max speed" means beyond kFastEps.
+constexpr float kFastEps = 1e-2f;
 } // namespace
 
 float speedOf(const MoveState &s) { return std::sqrt(s.vx * s.vx + s.vy * s.vy); }
@@ -25,7 +30,7 @@ bool stepMovement(MoveState &s, const MoveInput &in, const Rules &rules, const A
     s.stun = std::max(0.0f, s.stun - dt);
 
     bool dashed = false;
-    if (in.dash && s.dashCooldown <= 0.0f && s.stun <= 0.0f) {
+    if (in.dash && s.dashCooldown <= kTimerEps && s.stun <= kTimerEps) {
         float dx, dy;
         const float n = std::sqrt(ix * ix + iy * iy);
         if (n > 0.01f) {
@@ -42,17 +47,17 @@ bool stepMovement(MoveState &s, const MoveInput &in, const Rules &rules, const A
         dashed = true;
     }
 
-    if (s.dashLeft > 0.0f) {
+    if (s.dashLeft > kTimerEps) {
         s.dashLeft = std::max(0.0f, s.dashLeft - dt);  // committed: no steering
     } else {
-        const float control = s.stun > 0.0f ? 0.25f : 1.0f;
+        const float control = s.stun > kTimerEps ? 0.25f : 1.0f;
         const float tx = ix * rules.maxSpeed, ty = iy * rules.maxSpeed;
         float dvx = tx - s.vx, dvy = ty - s.vy;
         const float dlen = std::sqrt(dvx * dvx + dvy * dvy);
         // Over max speed (end of a dash/knockback) we brake harder, so the
         // burst stays short and the server's speed check stays tight.
         float maxDelta = rules.accel * control * dt;
-        if (speedOf(s) > rules.maxSpeed) {
+        if (s.vx * s.vx + s.vy * s.vy > rules.maxSpeed * rules.maxSpeed + kFastEps) {
             maxDelta = std::max(maxDelta, rules.accel * 2.5f * dt);
         }
         if (dlen > maxDelta && dlen > 0.0f) {
@@ -67,7 +72,7 @@ bool stepMovement(MoveState &s, const MoveInput &in, const Rules &rules, const A
     s.y += s.vy * dt;
     resolveCollisions(s, rules, arena);
 
-    if (speedOf(s) > 0.5f) {
+    if (s.vx * s.vx + s.vy * s.vy > 0.25f) {
         s.heading = std::atan2(-s.vx, s.vy) * kRadToDeg;
     }
     return dashed;
@@ -93,7 +98,7 @@ MotionPose predictMotion(const MotionSample &s, double age, const Rules &rules) 
         const double dvx = tx - vx, dvy = ty - vy;
         const double gap = std::sqrt(dvx * dvx + dvy * dvy);
         if (gap > 1e-6) {
-            const bool fast = vx * vx + vy * vy > double(rules.maxSpeed) * rules.maxSpeed + 1e-3;
+            const bool fast = vx * vx + vy * vy > double(rules.maxSpeed) * rules.maxSpeed + kFastEps;
             const double a = rules.accel * (fast ? 2.5 : 1.0);
             const double ta = std::min(left, gap / a);
             const double ax = dvx / gap * a, ay = dvy / gap * a;

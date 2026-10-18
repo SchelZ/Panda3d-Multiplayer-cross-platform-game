@@ -24,6 +24,13 @@ public:
     double networkToLocalTime(int64_t networkTime, double now, int bits = 16) const;
     int32_t localToNetworkTime(double localTime, int bits = 16) const;
 
+    // 120 Hz physics steps on the network clock (net/Protocol.h): step k ends
+    // at network time k / 120 s.
+    int64_t localToStep(double localTime) const;
+    double stepToLocalTime(int64_t step) const;
+    // The full step number of a 16-bit wire step, the one nearest `now`'s.
+    int64_t resolveStep(uint16_t step16, double now) const;
+
     double delta() const { return delta_; }
     bool synced() const { return uncertainty_ >= 0.0; }
     double uncertainty() const { return uncertainty_; }  // < 0 = never synced

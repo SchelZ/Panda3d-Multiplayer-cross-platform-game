@@ -1,11 +1,8 @@
-"""AI view of a player. The player's client owns the object; its movement
-arrives as compact binary samples (protocol.py, SERVER_MOVES), which the AI
-repository hands to DistributedArenaGameAI.onPlayerState to be judged."""
-
-from collections import deque
+"""AI view of a player. The AI creates it when the player's client asks to
+join (DistributedArenaGameAI.requestJoin) and owns it; the client only sends
+inputs, which the AI applies to `sim` (simulation.PlayerSim)."""
 
 from direct.directnotify import DirectNotifyGlobal
-from direct.distributed.ClockDelta import globalClockDelta
 from direct.distributed.DistributedObjectAI import DistributedObjectAI
 
 from .protocol import NO_SLOT
@@ -19,42 +16,21 @@ def sanitizeName(name):
 class DistributedArenaPlayerAI(DistributedObjectAI):
     notify = DirectNotifyGlobal.directNotify.newCategory('DistributedArenaPlayerAI')
 
-    def __init__(self, air):
+    def __init__(self, air, name='Player', colorIndex=0, ownerId=0, slot=NO_SLOT):
         DistributedObjectAI.__init__(self, air)
-        self.name = 'Player'
-        self.colorIndex = 0
-        self.ownerId = 0          # doIdBase of the owning client
-        self.slot = NO_SLOT       # one-byte id on the wire
-        self.registered = False
+        self.name = sanitizeName(name)
+        self.colorIndex = max(0, min(int(colorIndex), 11))
+        self.ownerId = ownerId    # doIdBase of the player's client
+        self.slot = slot          # one-byte id on the wire
+        self.sim = None           # simulation.PlayerSim, set by the game
 
-        # Server-side movement state (see DistributedArenaGameAI.onPlayerMoved).
-        self.validX = 0.0
-        self.validY = 0.0
-        self.heading = 0.0
-        self.lastMoveTime = None
-        self.moveBudget = 0.0
-        self.lastCorrection = -1e9
-        self.lastDash = -1e9
-        self.dashHits = set()
         self.lastHitTime = -1e9   # AI time this player was last hit
         self.lastChat = -1e9
-
-        # Lag compensation (see DistributedArenaGameAI._checkDashHits): accepted
-        # samples on the player's own timeline, as (time, x, y, vx, vy, arrival).
-        self.track = deque()
-        self.latency = None       # estimated one-way delay client -> AI (s)
-        self.viewDelay = 0.0      # how far in the past it draws others (s)
-        self.dashStart = -1e9     # current dash, on the player's timeline
+        self.dashStart = -1e9     # current dash (network time), for hits
         self.dashEnd = -1e9
-
-    @staticmethod
-    def sampleTime(timestamp, now, maxRewind):
-        """AI time of a 16-bit network timestamp, trusted only within
-        [now - maxRewind, now] so nobody can claim an arbitrary past."""
-        if timestamp is None:
-            return now
-        t = globalClockDelta.networkToLocalTime(timestamp, now, bits=16)
-        return min(now, max(now - maxRewind, t))
+        self.dashChecked = -1e9   # dash judged up to this time
+        self.dashHits = set()
+        self.drawings = {}        # victim doId -> (track length, motion.Drawing) this dash
 
     # Required fields.
     def setName(self, name):
@@ -68,21 +44,3 @@ class DistributedArenaPlayerAI(DistributedObjectAI):
 
     def getColorIndex(self):
         return self.colorIndex
-
-    def announceGenerate(self):
-        DistributedObjectAI.announceGenerate(self)
-        # Only valid while the generate message is being processed.
-        self.ownerId = self.air.getAvatarIdFromSender() or 0
-        slot = self.air.slotOf(self.doId)
-        self.slot = NO_SLOT if slot is None else slot
-        game = getattr(self.air, 'game', None)
-        if game is not None:
-            game.addPlayer(self)
-            self.registered = True
-
-    def delete(self):
-        game = getattr(self.air, 'game', None) if self.air else None
-        if self.registered and game is not None:
-            game.removePlayer(self)
-        self.registered = False
-        DistributedObjectAI.delete(self)

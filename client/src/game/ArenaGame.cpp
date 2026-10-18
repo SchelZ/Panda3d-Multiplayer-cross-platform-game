@@ -11,6 +11,7 @@ namespace arena::game {
 
 namespace {
 net::FieldTable<ArenaGame> g_fields;
+const DCField *g_requestJoin = nullptr;
 const DCField *g_requestChat = nullptr;
 const DCField *g_ping = nullptr;
 } // namespace
@@ -21,14 +22,11 @@ bool ArenaGame::bindFields(const DCClass &dclass) {
     g_fields.bind(dclass, "setRound", &ArenaGame::setRound);
     g_fields.bind(dclass, "setOrbs", &ArenaGame::setOrbs);
     g_fields.bind(dclass, "setScores", &ArenaGame::setScores);
-    g_fields.bind(dclass, "orbSpawned", &ArenaGame::orbSpawned);
-    g_fields.bind(dclass, "orbCollected", &ArenaGame::orbCollected);
-    g_fields.bind(dclass, "playerHit", &ArenaGame::playerHit);
     g_fields.bind(dclass, "chatMessage", &ArenaGame::chatMessage);
     g_fields.bind(dclass, "notice", &ArenaGame::notice);
+    g_fields.bind(dclass, "joined", &ArenaGame::joined);
     g_fields.bind(dclass, "pong", &ArenaGame::pong);
-    g_fields.bind(dclass, "knockback", &ArenaGame::knockback);
-    g_fields.bind(dclass, "correctPosition", &ArenaGame::correctPosition);
+    g_requestJoin = g_fields.field(dclass, "requestJoin");
     g_requestChat = g_fields.field(dclass, "requestChat");
     g_ping = g_fields.field(dclass, "ping");
     return g_fields.missing().empty();
@@ -41,6 +39,12 @@ void ArenaGame::receiveField(const DCField &field, net::FieldReader &in) {
 void ArenaGame::announceGenerate() { events_.onGameGenerated(*this); }
 
 void ArenaGame::disable() { events_.onGameDisabled(*this); }
+
+void ArenaGame::requestJoin(const std::string &name, int colorIndex) {
+    cr_.sendUpdate(*this, g_requestJoin, [&name, colorIndex](net::FieldWriter &out) {
+        out.str(name).u32(static_cast<uint32_t>(colorIndex));
+    });
+}
 
 void ArenaGame::requestChat(const std::string &text) {
     cr_.sendUpdate(*this, g_requestChat, [&text](net::FieldWriter &out) { out.str(text); });
@@ -141,35 +145,27 @@ void ArenaGame::setScores(net::FieldReader &in) {
     if (generated() && changed) events_.onScoresChanged();
 }
 
-void ArenaGame::orbSpawned(net::FieldReader &in) {
-    in.push();
-    const auto id = static_cast<uint16_t>(in.u32());
-    Orb orb;
-    orb.x = static_cast<float>(in.f64());
-    orb.y = static_cast<float>(in.f64());
-    orb.kind = static_cast<int>(in.u32());
-    in.pop();
-    orbs_[id] = orb;
-    events_.onOrbSpawned(id);
-}
-
-void ArenaGame::orbCollected(net::FieldReader &in) {
-    const auto id = static_cast<uint16_t>(in.u32());
-    const auto slot = static_cast<uint8_t>(in.u32());
-    const int score = static_cast<int>(in.u32());
-    scores_[slot] = score;
-    events_.onOrbCollected(id, slot);  // before erasing, so the game can see where it was
-    orbs_.erase(id);
-    events_.onScoresChanged();
-}
-
-void ArenaGame::playerHit(net::FieldReader &in) {
-    const auto attacker = static_cast<uint8_t>(in.u32());
-    const auto victim = static_cast<uint8_t>(in.u32());
-    scores_[attacker] = static_cast<int>(in.u32());
-    scores_[victim] = static_cast<int>(in.u32());
-    events_.onPlayerHit(attacker, victim);
-    events_.onScoresChanged();
+void ArenaGame::applyEvent(const net::FrameEvent &e) {
+    switch (e.kind) {
+    case net::kEventOrbSpawned:
+        orbs_[e.orbId] = Orb{e.x / 10.0f, e.y / 10.0f, e.orbKind};
+        events_.onOrbSpawned(e.orbId);
+        break;
+    case net::kEventOrbCollected:
+        scores_[e.slot] = e.score;
+        events_.onOrbCollected(e.orbId, e.slot);  // before erasing, so the game can see where it was
+        orbs_.erase(e.orbId);
+        events_.onScoresChanged();
+        break;
+    case net::kEventPlayerHit:
+        scores_[e.slot] = e.score;
+        scores_[e.victim] = e.victimScore;
+        events_.onPlayerHit(e.slot, e.victim);
+        events_.onScoresChanged();
+        break;
+    default:
+        break;
+    }
 }
 
 void ArenaGame::chatMessage(net::FieldReader &in) {
@@ -185,18 +181,12 @@ void ArenaGame::notice(net::FieldReader &in) {
     events_.onNotice(kind, slot, value);
 }
 
+void ArenaGame::joined(net::FieldReader &in) {
+    const auto slot = static_cast<uint8_t>(in.u32());
+    const uint32_t playerId = in.u32();
+    events_.onJoined(slot, playerId);
+}
+
 void ArenaGame::pong(net::FieldReader &in) { events_.onPong(static_cast<uint16_t>(in.u32())); }
-
-void ArenaGame::knockback(net::FieldReader &in) {
-    const auto vx = static_cast<float>(in.f64());
-    const auto vy = static_cast<float>(in.f64());
-    events_.onKnockback(vx, vy);
-}
-
-void ArenaGame::correctPosition(net::FieldReader &in) {
-    const auto x = static_cast<float>(in.f64());
-    const auto y = static_cast<float>(in.f64());
-    events_.onCorrectPosition(x, y);
-}
 
 } // namespace arena::game

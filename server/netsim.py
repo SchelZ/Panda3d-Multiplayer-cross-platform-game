@@ -7,7 +7,8 @@ Clients connect to --listen instead of the server. Every chunk of data is held
 back for half the round trip plus a random jitter in each direction. Order is
 preserved, as on a real TCP connection, so jitter shows up the way it does in
 practice: messages arrive late and in bunches. --kbps limits the bandwidth per
-direction and connection.
+direction and connection, and --overhead adds the IP and TCP headers each
+packet costs on a real link (about 52 bytes) to every chunk.
 
 Used by tests/e2e_cpp_clients.py --netsim to test the game under latency.
 """
@@ -22,10 +23,11 @@ import time
 
 
 class Link:
-    def __init__(self, delayMs, jitterMs, kbps, rng):
+    def __init__(self, delayMs, jitterMs, kbps, rng, overhead=0):
         self.delay = delayMs / 1000.0
         self.jitter = jitterMs / 1000.0
         self.bytesPerSec = kbps * 1000.0 / 8.0 if kbps > 0 else 0.0
+        self.overhead = overhead
         self.rng = rng
 
     async def pump(self, reader, writer):
@@ -57,7 +59,7 @@ class Link:
                     break
                 if self.bytesPerSec:
                     # Serialisation delay of a link with this bandwidth.
-                    wireFree = max(wireFree, time.monotonic()) + len(data) / self.bytesPerSec
+                    wireFree = max(wireFree, time.monotonic()) + (len(data) + self.overhead) / self.bytesPerSec
                     due = max(due, wireFree)
                 wait = due - time.monotonic()
                 if wait > 0:
@@ -73,8 +75,8 @@ class Link:
 async def serve(args):
     host, _, port = args.server.rpartition(':')
     rng = random.Random(args.seed)
-    up = Link(args.rtt / 2.0, args.jitter, args.kbps, rng)
-    down = Link(args.rtt / 2.0, args.jitter, args.kbps, rng)
+    up = Link(args.rtt / 2.0, args.jitter, args.kbps, rng, args.overhead)
+    down = Link(args.rtt / 2.0, args.jitter, args.kbps, rng, args.overhead)
 
     async def handle(clientReader, clientWriter):
         try:
@@ -92,7 +94,8 @@ async def serve(args):
     server = await asyncio.start_server(handle, '127.0.0.1', args.listen)
     print('netsim ready: 127.0.0.1:%d -> %s, rtt %d ms, jitter 0-%d ms per direction%s'
           % (args.listen, args.server, args.rtt, args.jitter,
-             ', %d kbit/s' % args.kbps if args.kbps else ''), flush=True)
+             ', %d kbit/s (+%d bytes per packet)' % (args.kbps, args.overhead) if args.kbps else ''),
+          flush=True)
     stop = asyncio.get_running_loop().create_future()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -110,6 +113,8 @@ def main():
     p.add_argument('--rtt', type=float, default=100.0, help='round trip time in ms')
     p.add_argument('--jitter', type=float, default=0.0, help='extra random delay, 0..N ms per direction')
     p.add_argument('--kbps', type=float, default=0.0, help='bandwidth limit per direction (kbit/s)')
+    p.add_argument('--overhead', type=int, default=0,
+                   help='bytes of headers each chunk (about one TCP packet) costs on the link')
     p.add_argument('--seed', type=int, default=None)
     args = p.parse_args()
     try:

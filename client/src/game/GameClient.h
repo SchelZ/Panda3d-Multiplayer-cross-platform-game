@@ -1,6 +1,7 @@
-// Game logic of the client: connection flow, local player (prediction at a
-// fixed 120 Hz step), remote players, orbs, HUD state and the bot brain.
-// World and Hud are optional, so the same code runs headless.
+// Game logic of the client: connection flow, our player (asked of the AI,
+// steered with inputs and predicted at the AI's 120 Hz step), other players,
+// orbs, HUD state and the bot brain. World and Hud are optional, so the same
+// code runs headless.
 #pragma once
 
 #include "app/Options.h"
@@ -8,6 +9,7 @@
 #include "game/ArenaPlayer.h"
 #include "game/GameEvents.h"
 #include "game/Movement.h"
+#include "game/Prediction.h"
 #include "net/ClientRepository.h"
 
 #include <array>
@@ -31,7 +33,7 @@ struct PlayerInput {
 
 class GameClient final : public GameEvents {
 public:
-    enum class Phase { Offline, Connecting, SyncingTime, EnteringArena, Playing, Rejected };
+    enum class Phase { Offline, Connecting, SyncingTime, EnteringArena, Joining, Playing, Rejected };
 
     // What happened, for automation (exit codes) and the HUD.
     struct Counters {
@@ -42,7 +44,9 @@ public:
         int chatsReceived = 0;
         int hitsGiven = 0;
         int hitsTaken = 0;
-        int corrections = 0;
+        int corrections = 0;     // the AI put our player elsewhere than we predicted
+        double correctionMaxCm = 0.0;
+        int selfs = 0;           // SELF messages (our exact state) received
         int reconnects = 0;
         int arenaRebuilds = 0;   // arena/orb resets after the first generate
         double pingSumMs = 0.0;  // over `pongs` replies
@@ -55,7 +59,7 @@ public:
         int contactsConfirmed = 0;
         int contactsMissed = 0;
         int phantomHits = 0;
-        int positionSends = 0;
+        int inputSends = 0;
         double playSeconds = 0.0;
         uint64_t frames = 0;
         uint64_t bytesIn = 0, bytesOut = 0;
@@ -88,9 +92,8 @@ public:
     void onPlayerHit(uint8_t attacker, uint8_t victim) override;
     void onChat(uint8_t slot, const std::string &text) override;
     void onNotice(uint8_t kind, uint8_t slot, uint16_t value) override;
+    void onJoined(uint8_t slot, uint32_t playerId) override;
     void onPong(uint16_t context) override;
-    void onKnockback(float vx, float vy) override;
-    void onCorrectPosition(float x, float y) override;
     void onPlayerGenerated(ArenaPlayer &player) override;
     void onPlayerDisabled(ArenaPlayer &player) override;
     void onPlayerDashed(ArenaPlayer &player) override;
@@ -102,13 +105,16 @@ private:
     void onRepositoryReady();
     void onTimeSynced();
     void enterArena();
-    void createLocalPlayer();
+    void requestJoin();
+    void startPlaying();
+    void onSelf(const net::SelfState &msg);
+    Prediction::Others otherPositions() const;
     void simulate(double now, double dt, PlayerInput input);
     PlayerInput botInput(double now);
     void updateHud(double now, double dt);
     void writeTrace(double now);
     void onSlot(uint8_t slot, uint32_t doId);
-    void onMove(uint8_t slot, const net::WireState &state);
+    void onMove(uint8_t slot, const net::WireState &state, uint16_t sentStep);
     void resetSlots();
     std::string playerName(uint8_t slot) const;
     int playerColor(uint8_t slot) const;
@@ -124,7 +130,8 @@ private:
     double phaseSince_ = 0.0;
     double now_ = 0.0;
     ArenaGame *game_ = nullptr;
-    ArenaPlayer *local_ = nullptr;
+    ArenaPlayer *local_ = nullptr;  // our player (the AI's object we steer)
+    uint32_t myDoId_ = 0;           // its doId, from DistributedArenaGame.joined
     std::unordered_map<uint32_t, ArenaPlayer *> players_;  // every generated player
 
     // Movement slots (net/Protocol.h): who is behind each one-byte player id.
@@ -133,16 +140,23 @@ private:
         ArenaPlayer *player = nullptr;
         bool hasState = false;  // a sample that arrived before the player's generate
         net::WireState state;
+        uint16_t sentStep = 0;
         std::string name;       // kept after the player left, for the "left" notice
         int color = 0;
     };
     std::array<Slot, 256> slots_;
     uint8_t localSlot_ = net::kNoSlot;
 
-    MoveState move_, prevMove_;
+    Prediction prediction_;      // our player, from our inputs
+    bool dashLatch_ = false;     // dash pressed, not sent yet
+    float smoothX_ = 0.0f, smoothY_ = 0.0f;  // corrections, faded out on screen
     float shownHeading_ = 0.0f;  // our body's drawn heading (turnToward)
     ViewDelay viewDelay_;        // how far back remote players are drawn
-    double accumulator_ = 0.0;
+    // Steps after their sent step the others' samples reached our prediction,
+    // last 64 (net::InputCmd::sampleDelay).
+    std::array<uint8_t, 64> sampleDelays_{};
+    size_t sampleDelayNext_ = 0;
+    uint8_t sampleDelay() const;
     double reconnectAt_ = 0.0;
     int backoffStep_ = 0;
     std::string offlineReason_;
@@ -150,6 +164,7 @@ private:
     Counters counters_;
     double playingSince_ = -1.0;
     bool said_ = false;
+    bool closing_ = false;  // disconnecting on purpose: do not ask for a new player
 
     uint16_t pingContext_ = 0;
     double pingSentAt_ = 0.0;
@@ -187,6 +202,7 @@ private:
 
     std::mt19937 rng_;
     std::FILE *trace_ = nullptr;
+    int64_t tracedStep_ = 0;  // newest step written as an L line
 };
 
 } // namespace arena::game

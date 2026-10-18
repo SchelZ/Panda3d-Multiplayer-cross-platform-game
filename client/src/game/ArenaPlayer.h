@@ -1,8 +1,8 @@
-// Client view of DistributedArenaPlayer (arena.dc): name and color are DC
-// fields; movement travels as compact binary samples keyed by the player's
-// one-byte slot (net/Protocol.h). The local player's object is owned by this
-// client and sends its predicted motion (DeadReckoning); remote players are
-// drawn with RemoteMotion.
+// Client view of DistributedArenaPlayer (arena.dc). The AI creates and owns
+// every player, ours included: name and color are DC fields, movement arrives
+// as compact binary samples keyed by the player's one-byte slot
+// (net/Protocol.h). Other players are drawn with RemoteMotion; ours is
+// predicted by GameClient (Prediction) and only shown here.
 #pragma once
 
 #include "net/DistributedObject.h"
@@ -11,6 +11,7 @@
 #include "game/DeadReckoning.h"
 #include "game/RemoteMotion.h"
 
+#include <array>
 #include <cstdint>
 #include <string>
 
@@ -36,25 +37,25 @@ public:
     uint8_t slot() const { return slot_; }
     void setSlot(uint8_t slot) { slot_ = slot; }
 
-    // --- local player -----------------------------------------------------
-    void setIdentity(const std::string &name, int colorIndex);
-    void setLocalPose(float x, float y, float h, float vx, float vy);
-    // The movement input held (unit length or zero) and the rest of a dash
-    // (MoveState::dashLeft).
-    void setLocalInput(float ix, float iy, float dashLeft);
-    // Sends a sample when the others' prediction would go wrong
-    // (DeadReckoning), or at once with `force` / after sendDash() / sendSoon().
-    // `viewDelay` is ViewDelay::wire(): how far back we draw the others.
-    void broadcastPose(double now, uint8_t viewDelay, const Rules &rules, bool force = false);
-    void sendDash();   // the next sample carries kFlagDash
-    void sendSoon() { sendNow_ = true; }
-    int positionSends() const { return positionSends_; }
+    // --- our player (GameClient predicts it) --------------------------------
+    bool controlled() const { return controlled_; }
+    void setControlled(bool controlled) { controlled_ = controlled; }
+    void setLocalPose(float x, float y, float h);
 
-    // --- remote players ---------------------------------------------------
-    // Returns how late the sample arrived (s), or -1 before the clock is synced.
-    double applyState(const net::WireState &state, double now, double delay, const Rules &rules);
-    // Pose `delay` in the past (RemoteMotion), heading turned toward the motion.
+    // --- other players ----------------------------------------------------
+    // `sentStep`: the step the AI sent it at (SERVER_FRAME). Returns how late
+    // the sample arrived (s), or -1 before the clock is synced.
+    double applyState(const net::WireState &state, uint16_t sentStep, double now, double delay, const Rules &rules);
+    // Pose `delay` in the past (RemoteMotion), heading turned toward the
+    // motion, or toward where the AI says the player faces while it stands.
     void updateSmoothing(double now, float dt, double delay, const Rules &rules);
+
+    // The newest samples received, on the network clock, with the steps they
+    // were sent at: our player bumps into this one where they say it is
+    // (Prediction).
+    static constexpr int kKnown = 16;
+    int knownCount() const { return knownCount_; }
+    const std::array<KnownSample, kKnown> &known() const { return known_; }  // oldest first
 
     float x() const { return x_; }
     float y() const { return y_; }
@@ -71,18 +72,15 @@ private:
     std::string name_ = "Player";
     int colorIndex_ = 0;
     uint8_t slot_ = net::kNoSlot;
+    bool controlled_ = false;
     float x_ = 0.0f, y_ = 0.0f, h_ = 0.0f;
-    float vx_ = 0.0f, vy_ = 0.0f;
-    float ix_ = 0.0f, iy_ = 0.0f, dashLeft_ = 0.0f;
+    bool hasHeading_ = false;
+    float facing_ = 0.0f;  // the newest sample's heading
 
-    // Local player.
-    DeadReckoning reckoning_;
-    int positionSends_ = 0;
-    bool sendNow_ = false;
-    bool dashPending_ = false;
-
-    // Remote player.
+    // Other players.
     RemoteMotion motion_;
+    std::array<KnownSample, kKnown> known_{};
+    int knownCount_ = 0;
     double lastDash_ = -1e9;
 };
 

@@ -274,6 +274,8 @@ void keepCounters(AppState &app) {
     k.hitsGiven += c.hitsGiven;
     k.hitsTaken += c.hitsTaken;
     k.corrections += c.corrections;
+    k.correctionMaxCm = std::max(k.correctionMaxCm, c.correctionMaxCm);
+    k.selfs += c.selfs;
     k.reconnects += c.reconnects;
     k.arenaRebuilds += c.arenaRebuilds;
     k.pingSumMs += c.pingSumMs;
@@ -283,7 +285,7 @@ void keepCounters(AppState &app) {
     k.contactsConfirmed += c.contactsConfirmed;
     k.contactsMissed += c.contactsMissed;
     k.phantomHits += c.phantomHits;
-    k.positionSends += c.positionSends;
+    k.inputSends += c.inputSends;
     k.playSeconds += c.playSeconds;
     k.frames += c.frames;
     k.bytesIn += c.bytesIn;
@@ -898,13 +900,15 @@ int runApp(Options options, int argc, char **argv) {
     const double secs = counters.playSeconds > 0.0 ? counters.playSeconds : 1.0;
     std::printf("summary: played=%d others=%d orbs=%d pongs=%d chats=%d hits=%d/%d corrections=%d reconnects=%d"
                 " arena_rebuilds=%d ping_avg_ms=%.1f ping_max_ms=%.1f dashes=%d contacts=%d"
-                " confirmed=%d missed=%d phantom=%d pos_sends_s=%.1f up_Bps=%.0f down_Bps=%.0f fps=%.1f\n",
+                " confirmed=%d missed=%d phantom=%d input_sends_s=%.1f selfs_s=%.2f correction_max_cm=%.0f"
+                " up_Bps=%.0f down_Bps=%.0f fps=%.1f\n",
                 counters.everPlayed ? 1 : 0, counters.maxOtherPlayers, counters.orbsCollected, counters.pongs,
                 counters.chatsReceived, counters.hitsGiven, counters.hitsTaken, counters.corrections,
                 counters.reconnects, counters.arenaRebuilds,
                 counters.pongs ? counters.pingSumMs / counters.pongs : 0.0,
                 counters.pingMaxMs, counters.dashes, counters.dashContacts, counters.contactsConfirmed,
-                counters.contactsMissed, counters.phantomHits, counters.positionSends / secs,
+                counters.contactsMissed, counters.phantomHits, counters.inputSends / secs,
+                counters.selfs / secs, counters.correctionMaxCm,
                 counters.bytesOut / secs, counters.bytesIn / secs, counters.frames / secs);
     std::fflush(stdout);
 

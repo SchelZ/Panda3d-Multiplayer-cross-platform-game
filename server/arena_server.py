@@ -32,6 +32,10 @@ def parseArgs(argv=None):
     p.add_argument('--orbs', type=int, default=18, help='orbs on the field')
     p.add_argument('--tick-rate', type=int, default=100,
                    help='server loop frequency in Hz (relay latency is at most 1/tick)')
+    p.add_argument('--batch-rate', type=float, default=30.0,
+                   help='batches of movement and events per second, each one TCP packet per '
+                        'player (default 30; 50 shows others a few ms sooner for ~25%% more '
+                        'traffic)')
     p.add_argument('--dc-dir', default=COMMON, help='folder with direct.dc and arena.dc')
     p.add_argument('--name', default=None,
                    help='server name shown to LAN clients (default: this computer\'s name)')
@@ -127,7 +131,8 @@ def main(argv=None):
             print('fatal: the AI lost its connection, stopping', file=sys.stderr, flush=True)
             requestStop()
 
-    air = ArenaAIRepository(args.port, token, dcFiles, rules, onReady=onReady, onLost=onLost)
+    air = ArenaAIRepository(args.port, token, dcFiles, rules, onReady=onReady, onLost=onLost,
+                            batchRate=args.batch_rate)
     simbase.air = air
 
     def requestStop(*_):
@@ -138,7 +143,7 @@ def main(argv=None):
     if hasattr(signal, 'SIGBREAK'):
         signal.signal(signal.SIGBREAK, requestStop)
 
-    last = {'time': time.monotonic(), 'msgs': 0, 'bytes': 0, 'out': 0}
+    last = {'time': time.monotonic(), 'msgs': 0, 'bytes': 0, 'out': 0, 'inputs': 0}
 
     def statusTask(task):
         if args.status_interval > 0 and time.monotonic() - last['time'] >= args.status_interval:
@@ -146,14 +151,16 @@ def main(argv=None):
             dt = now - last['time']
             s = server.stats
             game = air.game
-            print('[status] players %d | in %.0f msg/s %.1f KB/s | out %.0f msg/s | kicks %d%s'
+            print('[status] players %d | in %.0f msg/s %.1f KB/s (inputs %.0f/s) | out %.0f msg/s | '
+                  'kicks %d%s'
                   % (server.numPlayers(), (s['msgsIn'] - last['msgs']) / dt,
-                     (s['bytesIn'] - last['bytes']) / dt / 1024.0,
+                     (s['bytesIn'] - last['bytes']) / dt / 1024.0, (s['inputs'] - last['inputs']) / dt,
                      (s['msgsOut'] - last['out']) / dt, s['kicks'],
-                     ' | round %d, orbs taken %d, hits %d, corrections %d'
-                     % (game.roundNumber, game.stats['orbs'], game.stats['hits'],
-                        game.stats['corrections']) if game else ''), flush=True)
-            last.update(time=now, msgs=s['msgsIn'], bytes=s['bytesIn'], out=s['msgsOut'])
+                     ' | round %d, orbs taken %d, hits %d'
+                     % (game.roundNumber, game.stats['orbs'], game.stats['hits']) if game else ''),
+                  flush=True)
+            last.update(time=now, msgs=s['msgsIn'], bytes=s['bytesIn'], out=s['msgsOut'],
+                        inputs=s['inputs'])
         if state['stopping']:
             return task.done
         return task.cont

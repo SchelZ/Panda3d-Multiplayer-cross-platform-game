@@ -28,9 +28,8 @@ public:
     virtual void onNotice(uint8_t kind, uint8_t slot, uint16_t value) = 0;
 
     // Targeted replies from the AI to this client.
+    virtual void onJoined(uint8_t slot, uint32_t playerId) = 0;  // our player
     virtual void onPong(uint16_t context) = 0;
-    virtual void onKnockback(float vx, float vy) = 0;
-    virtual void onCorrectPosition(float x, float y) = 0;
 
     virtual void onPlayerGenerated(ArenaPlayer &player) = 0;
     virtual void onPlayerDisabled(ArenaPlayer &player) = 0;

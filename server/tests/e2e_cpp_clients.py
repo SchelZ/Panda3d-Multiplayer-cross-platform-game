@@ -6,8 +6,10 @@
 
 Several client binaries are used round-robin, so a Linux build and a Windows
 build (run through Wine when not on Windows) can be tested in the same game.
---netsim RTT[:JITTER] puts every client behind netsim.py (milliseconds), to
-test under internet latency; the totals line then shows how the netcode copes.
+--netsim RTT[:JITTER[:KBPS]] puts every client behind netsim.py (milliseconds,
+and a link of KBPS kbit/s each way that also counts 52 bytes of IP and TCP
+headers per packet), to test under internet latency; the totals line then
+shows how the netcode copes.
 Checks that every C++ client joins, sees the others, gets pongs from the AI,
 receives everyone's chat, scores, exits 0, and that the server survives and
 stops cleanly on SIGTERM.
@@ -89,17 +91,21 @@ def main():
     p.add_argument('client', nargs='+', help='arena_client binaries, used round-robin')
     p.add_argument('--clients', type=int, default=3)
     p.add_argument('--duration', type=float, default=14.0)
-    p.add_argument('--netsim', help='RTT[:JITTER] in ms: run the clients behind netsim.py')
+    p.add_argument('--netsim', help='RTT[:JITTER[:KBPS]]: run the clients behind netsim.py')
+    p.add_argument('--batch-rate', type=float, help='the server\'s --batch-rate')
     p.add_argument('--trace-dir', help='write --trace files there and report how smoothly clients '
                    'draw each other (tests/trace_stats.py)')
-    p.add_argument('--max-corrections', type=int, default=0,
-                   help='position corrections an honest client may get (0 on localhost)')
+    p.add_argument('--max-corrections', type=int, default=-1,
+                   help='mispredictions of its own player (over 5 cm) a client may have; default: '
+                        'one per 10 s of play, one per 3 s behind --netsim (an input that arrives '
+                        'later than usual is applied late)')
     args = p.parse_args()
 
     port = freePort()
     server = spawn(
         [sys.executable, os.path.join(SERVER_DIR, 'arena_server.py'), '--port', str(port),
-         '--status-interval', '0', '--round-time', '60'],
+         '--status-interval', '0', '--round-time', '60'] +
+        (['--batch-rate', str(args.batch_rate)] if args.batch_rate else []),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
         # Windows has no SIGTERM between processes; the server stops on CTRL_BREAK.
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if WINDOWS else 0)
@@ -112,11 +118,13 @@ def main():
     netsim = None
     clientPort = port
     if args.netsim:
-        rtt, _, jitter = args.netsim.partition(':')
+        rtt, _, rest = args.netsim.partition(':')
+        jitter, _, kbps = rest.partition(':')
         clientPort = freePort()
         netsim = spawn(
             [sys.executable, os.path.join(SERVER_DIR, 'netsim.py'), '--listen', str(clientPort),
-             '--server', '127.0.0.1:%d' % port, '--rtt', rtt, '--jitter', jitter or '0', '--seed', '1'],
+             '--server', '127.0.0.1:%d' % port, '--rtt', rtt, '--jitter', jitter or '0', '--seed', '1'] +
+            (['--kbps', kbps, '--overhead', '52'] if kbps else []),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         ok, lines = waitForLine(netsim, r'netsim ready', 10)
         print(''.join(lines).strip())
@@ -139,8 +147,8 @@ def main():
 
     failures = []
     totals = {'orbs': 0, 'hits': 0, 'dashes': 0, 'contacts': 0, 'confirmed': 0, 'missed': 0,
-              'phantom': 0, 'pos_sends_s': 0.0,
-              'up_Bps': 0.0, 'down_Bps': 0.0, 'ping_avg_ms': 0.0, 'clients': 0}
+              'phantom': 0, 'input_sends_s': 0.0, 'selfs_s': 0.0, 'corrections': 0,
+              'correction_max_cm': 0.0, 'up_Bps': 0.0, 'down_Bps': 0.0, 'ping_avg_ms': 0.0, 'clients': 0}
     for i, c in enumerate(clients):
         try:
             out, _ = c.communicate(timeout=args.duration + 30)
@@ -159,9 +167,10 @@ def main():
         played, others, orbs, pongs, chats, hitsGiven, _, corrections, reconnects = map(int, m.groups())
         totals['orbs'] += orbs
         totals['hits'] += hitsGiven
+        totals['corrections'] += corrections
         totals['clients'] += 1
-        for key in ('dashes', 'contacts', 'confirmed', 'missed', 'phantom', 'pos_sends_s',
-                    'up_Bps', 'down_Bps', 'ping_avg_ms'):
+        for key in ('dashes', 'contacts', 'confirmed', 'missed', 'phantom', 'input_sends_s',
+                    'selfs_s', 'up_Bps', 'down_Bps', 'ping_avg_ms'):
             v = re.search(r'\b%s=([\d.]+)' % key, out)
             if v:
                 totals[key] += float(v.group(1))
@@ -171,8 +180,14 @@ def main():
             failures.append('client %d got only %d pongs' % (i, pongs))
         if chats < args.clients:
             failures.append('client %d received %d chat lines, expected %d' % (i, chats, args.clients))
-        if corrections > args.max_corrections:
-            failures.append('client %d was corrected %d times (honest client!)' % (i, corrections))
+        v = re.search(r'\bcorrection_max_cm=([\d.]+)', out)
+        if v:
+            totals['correction_max_cm'] = max(totals['correction_max_cm'], float(v.group(1)))
+        allowed = args.max_corrections if args.max_corrections >= 0 else \
+            int(args.duration / (3 if args.netsim else 10)) + 1
+        if corrections > allowed:
+            failures.append('client %d mispredicted its player %d times (allowed %d)'
+                            % (i, corrections, allowed))
         if reconnects:
             failures.append('client %d reconnected %d times' % (i, reconnects))
         rebuilds = re.search(r'arena_rebuilds=(\d+)', out)
@@ -189,6 +204,9 @@ def main():
         server.send_signal(signal.CTRL_BREAK_EVENT if WINDOWS else signal.SIGTERM)
         try:
             out, _ = server.communicate(timeout=10)
+            if args.trace_dir:
+                with open(os.path.join(args.trace_dir, 'server.log'), 'w') as f:
+                    f.write(''.join(lines) + out)
             if server.returncode != 0:
                 failures.append('server exited with %s when asked to stop' % server.returncode)
             if 'Traceback' in out or 'Assertion' in out:
@@ -203,11 +221,13 @@ def main():
     n = max(1, totals['clients'])
     print('orbs collected by C++ clients: %d, dash hits: %d' % (totals['orbs'], totals['hits']))
     print('netcode: %d dashes, %d on-screen contacts: %d confirmed (%s), %d missed, %d phantom hits; '
-          'per client: ping %.0f ms, %.1f position updates/s, up %.0f B/s, down %.0f B/s'
+          'per client: ping %.0f ms, %.1f inputs/s, %.2f SELF/s, up %.0f B/s, down %.0f B/s; '
+          '%d mispredictions over 5 cm (worst %.0f cm)'
           % (totals['dashes'], totals['contacts'], totals['confirmed'],
              '%.0f%%' % (100.0 * totals['confirmed'] / totals['contacts']) if totals['contacts'] else 'n/a',
-             totals['missed'], totals['phantom'], totals['ping_avg_ms'] / n, totals['pos_sends_s'] / n, totals['up_Bps'] / n,
-             totals['down_Bps'] / n))
+             totals['missed'], totals['phantom'], totals['ping_avg_ms'] / n, totals['input_sends_s'] / n,
+             totals['selfs_s'] / n, totals['up_Bps'] / n, totals['down_Bps'] / n, totals['corrections'],
+             totals['correction_max_cm']))
     if args.trace_dir:
         sys.path.insert(0, HERE)
         import trace_stats

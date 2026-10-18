@@ -219,6 +219,7 @@ add_library(arena_net STATIC
     client/src/core/ResourcePack.cpp
     client/src/net/ClockDelta.cpp
     client/src/net/ClientRepository.cpp
+    client/src/net/Frame.cpp
     client/src/net/TimeManager.cpp
 )
 target_include_directories(arena_net PUBLIC client/src PRIVATE ${CMAKE_BINARY_DIR}/generated)
@@ -236,6 +237,7 @@ set(ARENA_CLIENT_SOURCES
     client/src/game/Hud.cpp
     client/src/game/Meshes.cpp
     client/src/game/Movement.cpp
+    client/src/game/Prediction.cpp
     client/src/game/RemoteMotion.cpp
     client/src/game/Scenery.cpp
     client/src/game/SplashScreen.cpp
@@ -352,6 +354,8 @@ if(ARENA_BUILD_TESTS)
         client/tests/MovementTests.cpp
         client/tests/ProtocolTests.cpp
         client/tests/DeadReckoningTests.cpp
+        client/tests/FrameTests.cpp
+        client/tests/PredictionTests.cpp
         client/tests/ResourcePackTests.cpp
         client/tests/SplashTests.cpp
         client/tests/TouchTests.cpp
@@ -360,6 +364,7 @@ if(ARENA_BUILD_TESTS)
         client/src/game/DeadReckoning.cpp
         client/src/game/Meshes.cpp
         client/src/game/Movement.cpp
+        client/src/game/Prediction.cpp
         client/src/game/RemoteMotion.cpp
         client/src/game/SplashScreen.cpp
         ${ARENA_PHONE_SOURCES}
@@ -383,8 +388,9 @@ if(ARENA_BUILD_TESTS)
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/server/tests/e2e_cpp_clients.py
                          $<TARGET_FILE:arena_client>
                  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/server)
-        # The same over a simulated internet link (server/netsim.py): honest
-        # clients must still never be corrected, and everything must arrive.
+        # The same over a simulated internet link (server/netsim.py): clients
+        # must still predict their own players (all but rare mispredictions),
+        # and everything must arrive.
         add_test(NAME end_to_end_wan
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/server/tests/e2e_cpp_clients.py
                          $<TARGET_FILE:arena_client> --clients 4 --duration 16 --netsim 150:20

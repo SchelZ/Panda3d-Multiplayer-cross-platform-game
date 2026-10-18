@@ -5,7 +5,9 @@
 //   connect -> hello -> SET_DOID_RANGE -> createReady
 //   setInterestZones() -> OBJECT_GENERATE / UPDATE_FIELD / DISABLE / DELETE
 //   REQUEST_GENERATES -> resend our objects for late joiners
-//   SERVER_SLOTS / SERVER_MOVES / CLIENT_MOVE -> compact binary movement
+//   CLIENT_INPUT / SERVER_FRAME / SERVER_SLOTS -> compact binary inputs,
+//   and movement and game events in one bit-packed message per batch
+//   (net/Protocol.h, net/Frame.h)
 //
 // and adds what a shipped game needs: non-blocking connect on a worker
 // thread, a version/DC-hash handshake, payload validation before any field
@@ -14,6 +16,7 @@
 
 #include "net/ClockDelta.h"
 #include "net/DistributedObject.h"
+#include "net/Frame.h"
 #include "net/Protocol.h"
 
 #include "cConnectionRepository.h"
@@ -88,13 +91,14 @@ public:
     template <class Fn>
     bool sendUpdate(const DistributedObject &obj, const DCField *field, Fn &&args);
 
-    // Sends our player's movement sample (CLIENT_MOVE, 13 bytes on the wire).
-    bool sendMove(const WireState &state);
+    // Sends our player's input (CLIENT_INPUT, 10 bytes on the wire).
+    bool sendInput(const InputCmd &input);
 
     // doIdBase of the client that sent the message being dispatched.
     uint32_t currentSender() const { return currentSender_; }
 
     ClockDelta &clockDelta() { return clockDelta_; }
+    const ClockDelta &clockDelta() const { return clockDelta_; }
     TimeManager *timeManager() const { return timeManager_; }
     void setTimeManager(TimeManager *tm) { timeManager_ = tm; }
 
@@ -107,7 +111,9 @@ public:
     std::function<void(uint16_t, const std::string &)> onRejected;
     std::function<void()> onLost;                              // connection dropped
     std::function<void(uint8_t slot, uint32_t doId)> onSlot;   // doId 0: slot freed
-    std::function<void(uint8_t slot, const WireState &)> onMove;
+    std::function<void(uint8_t slot, const WireState &, uint16_t sentStep)> onMove;
+    std::function<void(const FrameEvent &)> onEvent;          // orbs, hits
+    std::function<void(const SelfState &)> onSelf;            // our own player, from the AI
 
     // A connection that delivers nothing for this long is treated as dead
     // (the game pings the AI every 2 s, so silence means a half-open socket).
@@ -138,7 +144,7 @@ private:
     void handleRequestGenerates(DatagramIterator &di);
     void handleReject(DatagramIterator &di);
     void handleSlots(DatagramIterator &di);
-    void handleMoves(DatagramIterator &di);
+    void handleFrame(DatagramIterator &di);
 
     static size_t validateField(const DCField &field, const char *data, size_t size);
     bool parseGenerate(const DCClass &dclass, const char *data, size_t size,
@@ -166,6 +172,7 @@ private:
     std::vector<uint32_t> interestZones_;
     TimeManager *timeManager_ = nullptr;
     ClockDelta clockDelta_;
+    FrameDecoder frames_;
     Stats stats_;
     double lastReceive_ = 0.0;
 };
