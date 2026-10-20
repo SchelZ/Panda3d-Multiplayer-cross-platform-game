@@ -154,9 +154,10 @@ void configure(const Options &o) {
 #ifdef ARENA_GLES
     set("load-display pandagles2");
     set("aux-display pandagles");
-#endif
+#else
+    set("load-display pandagl");
     set("aux-display p3tinydisplay");
-
+#endif
     // The window's framebuffer, stated rather than left to the driver: 8 bits
     // per colour (a 16-bit 565 screen would band the sky), a 24-bit depth
     // buffer (16 bits make distant hills and trees flicker) and no stencil
@@ -171,6 +172,10 @@ void configure(const Options &o) {
     set("win-origin -2 -2");  // centred on the screen
     set("text-encoding utf8");
     set("textures-power-2 none");
+    set("compressed-textures 1");
+    set("driver-compress-textures 1");
+    set("compress-channels 1");
+    
     // HUD text: mipmapped glyphs stay crisp when small (no shimmering
     // strokes), and larger font pages hold every glyph the HUD uses on one or
     // two textures, so the text draws in fewer batches.
@@ -202,6 +207,8 @@ void configure(const Options &o) {
         // Phones: at most 60 frames a second, also on 90 and 120 Hz screens,
         // so the phone stays cool and keeps its full clock speed (and its
         // battery) through a round.
+        set("yield-timeslice 1");
+        set("cursor-hidden true");
         set("clock-mode limited");
         set("clock-frame-rate 60");
         set("sleep-precision 0");

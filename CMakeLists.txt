@@ -31,7 +31,7 @@ if(ANDROID)
     # instead of the NDK's -O3 -g: Android's usual release level, objects a
     # fraction of the size (the library is stripped anyway), and NDK r27's
     # clang crashed on Windows optimising FreeType at -O3 -g.
-    add_compile_options(-O2 -g0)
+    add_compile_options(-O2 -g0 -fvisibility=hidden -ffunction-sections -fdata-sections)
 endif()
 
 # C++ client of Panda Arena, built with g++ on Linux and MinGW-w64 g++ on Windows.
@@ -100,10 +100,18 @@ message(STATUS "Panda3D ${Panda3D_VERSION} (shader generator: ${Panda3D_HAVE_CG}
 function(arena_link_panda3d target)
     target_sources(${target} PRIVATE ${Panda3D_OBJECTS})
     target_link_libraries(${target} PRIVATE Panda3D::Panda3D)
+
+    target_link_options(${target} PRIVATE
+        "$<$<CONFIG:Release,MinSizeRel>:-Wl,--strip-all>"
+        "$<$<CONFIG:Release,MinSizeRel>:-Wl,--gc-sections>"
+        "$<$<CONFIG:Release>:-Wl,--as-needed>"
+    )
+
     if(ARENA_PGO STREQUAL "GEN")
         target_link_options(${target} PRIVATE -fprofile-generate=${ARENA_PGO_DIR})
     endif()
-    target_link_options(${target} PRIVATE $<$<CONFIG:Release,MinSizeRel>:-s>)  # RelWithDebInfo keeps symbols
+
+
     if(MINGW)
         # One self-contained .exe: no libstdc++/libgcc/winpthread DLLs to ship.
         target_link_options(${target} PRIVATE -static -static-libgcc -static-libstdc++)
@@ -111,6 +119,18 @@ function(arena_link_panda3d target)
     if(ANDROID)
         # NativeActivity looks this up in libarena.so (AndroidMain.cpp).
         target_link_options(${target} PRIVATE -Wl,-u,ANativeActivity_onCreate)
+    endif()
+
+    if(ANDROID)
+        target_link_options(${target} PRIVATE
+            -Wl,--exclude-libs,ALL -Wl,--build-id=none -Wl,--icf=safe
+            -Wl,-z,max-page-size=16384 -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack)
+    elseif(MINGW)
+        target_link_options(${target} PRIVATE
+            -Wl,--no-insert-timestamp -Wl,--dynamicbase -Wl,--nxcompat -Wl,--high-entropy-va)
+    elseif(UNIX)
+        target_link_options(${target} PRIVATE
+            -Wl,--build-id=none -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack)
     endif()
 endfunction()
 

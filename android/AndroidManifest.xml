@@ -14,6 +14,7 @@
     <application android:label="Panda Arena"
                  android:icon="@mipmap/ic_launcher"
                  android:hasCode="false"
+                 android:debuggable="false"
                  android:allowBackup="false"
                  android:extractNativeLibs="true"
                  android:theme="@style/Theme.Arena">

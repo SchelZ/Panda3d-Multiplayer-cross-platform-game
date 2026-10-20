@@ -1,0 +1,25 @@
+
+services:
+  game-server:
+    build:
+      context: ..
+      dockerfile: backend/Dockerfile
+    init: true
+    restart: unless-stopped
+    container_name: panda-arena-server
+
+    ports:
+      - "4400:4400/tcp"
+      - "4400:4400/udp"
+
+    stop_grace_period: 20s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1.0
