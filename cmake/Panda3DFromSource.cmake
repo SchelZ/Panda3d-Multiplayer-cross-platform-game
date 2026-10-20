@@ -18,15 +18,75 @@ include(FetchContent)
 set(ARENA_PANDA3D_TAG "v1.10.16")
 set(PANDA3D_SOURCE_DIR "" CACHE PATH "Panda3D source tree (empty: fetch ${ARENA_PANDA3D_TAG} from GitHub)")
 
+# Only these Panda3D folders are downloaded (partial clone + sparse checkout):
+# exactly the ones whose sources or headers this file compiles or puts on the
+# include path (the _p3_incdirs list below, plus the display back ends of every
+# platform so one checkout works for Linux, Windows and Android).
+# Everything else in the repo (samples, models, dmodels, doc, pandatool, contrib,
+# makepanda, tests, the rest of direct/ and of panda/src ...) is never fetched.
+# If a patch in cmake/panda3d-patches/ touches a file outside these folders,
+# add its folder here.
+set(ARENA_PANDA3D_SPARSE_DIRS
+    dtool/src/dtoolbase dtool/src/dtoolutil dtool/src/prc dtool/src/dconfig
+    dtool/src/interrogatedb dtool/metalibs/dtool dtool/metalibs/dtoolconfig
+    panda/src/pandabase panda/src/express panda/src/downloader panda/src/pipeline
+    panda/src/linmath panda/src/putil panda/src/audio panda/src/event panda/src/mathutil
+    panda/src/gsgbase panda/src/pnmimage panda/src/nativenet panda/src/net
+    panda/src/pstatclient panda/src/gobj panda/src/pgraphnodes panda/src/pgraph
+    panda/src/cull panda/src/dgraph panda/src/device panda/src/display panda/src/chan
+    panda/src/char panda/src/pnmtext panda/src/text panda/src/movies panda/src/grutil
+    panda/src/tform panda/src/collide panda/src/parametrics panda/src/pgui
+    panda/src/pnmimagetypes panda/src/recorder panda/src/framework panda/src/glstuff
+    panda/metalibs/panda panda/metalibs/pandaexpress
+    direct/src/directbase direct/src/deadrec
+    # renderers and window systems (OpenGL, OpenGL ES, X11, EGL, Win32, Android)
+    panda/src/glgsg panda/metalibs/pandagl panda/src/gles2gsg panda/metalibs/pandagles2
+    panda/src/x11display panda/src/glxdisplay panda/src/egldisplay
+    panda/src/windisplay panda/src/wgldisplay
+    panda/src/android panda/src/androiddisplay
+    CACHE STRING "Panda3D folders to download (everything else is skipped)")
+
 if(NOT PANDA3D_SOURCE_DIR)
-    FetchContent_Declare(panda3d_src
-        GIT_REPOSITORY https://github.com/panda3d/panda3d.git
-        GIT_TAG ${ARENA_PANDA3D_TAG}
-        GIT_SHALLOW TRUE
-        GIT_PROGRESS TRUE
-        SOURCE_SUBDIR no-cmake-build)  # 1.10 has no CMake build; just download it
-    message(STATUS "Fetching Panda3D ${ARENA_PANDA3D_TAG} source (once, ~150 MB)")
-    FetchContent_MakeAvailable(panda3d_src)
+    find_package(Git REQUIRED)
+
+    # Same location FetchContent would use: <build>/_deps/panda3d_src-src
+    if(FETCHCONTENT_BASE_DIR)
+        set(_p3_base "${FETCHCONTENT_BASE_DIR}")
+    else()
+        set(_p3_base "${CMAKE_BINARY_DIR}/_deps")
+    endif()
+    set(panda3d_src_SOURCE_DIR "${_p3_base}/panda3d_src-src")
+
+    if(NOT EXISTS "${panda3d_src_SOURCE_DIR}/panda/src/pgraph/nodePath.cxx")
+        message(STATUS "Fetching Panda3D ${ARENA_PANDA3D_TAG} source (once, ~6 MB: only the folders this build compiles)")
+        file(REMOVE_RECURSE "${panda3d_src_SOURCE_DIR}")
+
+        # Shallow + blobless + sparse: only the files that are checked out are downloaded.
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} clone
+                    --depth 1 --branch ${ARENA_PANDA3D_TAG} --no-tags
+                    --filter=blob:none --sparse
+                    https://github.com/panda3d/panda3d.git "${panda3d_src_SOURCE_DIR}"
+            RESULT_VARIABLE _p3_rc)
+        if(NOT _p3_rc EQUAL 0)
+            file(REMOVE_RECURSE "${panda3d_src_SOURCE_DIR}")
+            message(FATAL_ERROR "git clone of Panda3D ${ARENA_PANDA3D_TAG} failed (needs git >= 2.35)")
+        endif()
+
+        # Only the folders in ARENA_PANDA3D_SPARSE_DIRS ("/dir/" = that folder, recursively).
+        set(_p3_sparse_patterns)
+        foreach(_dir IN LISTS ARENA_PANDA3D_SPARSE_DIRS)
+            list(APPEND _p3_sparse_patterns "/${_dir}/")
+        endforeach()
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} sparse-checkout set --no-cone ${_p3_sparse_patterns}
+            WORKING_DIRECTORY "${panda3d_src_SOURCE_DIR}"
+            RESULT_VARIABLE _p3_rc)
+        if(NOT _p3_rc EQUAL 0)
+            file(REMOVE_RECURSE "${panda3d_src_SOURCE_DIR}")
+            message(FATAL_ERROR "git sparse-checkout of Panda3D failed")
+        endif()
+    endif()
     set(_p3src "${panda3d_src_SOURCE_DIR}")
 else()
     set(_p3src "${PANDA3D_SOURCE_DIR}")
